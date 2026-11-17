@@ -105,6 +105,12 @@ func TestPromiseFindsWorkLeftForLater(t *testing.T) {
 		{"If you prefer the short one (e.g. two columns), I'll build the page.", ""},
 		// and a promise with one is quoted whole
 		{"The import runs. I'll check config.yaml again when it ends.", "I'll check config.yaml again when it ends."},
+		{"The import runs. I'll check both files (e.g. config.yaml) when it ends.", "I'll check both files (e.g. config.yaml) when it ends."},
+		// a sentence that opens with a small letter joins the one before for an ask, and is its own for a promise:
+		// the promise is looked for in the last two, no further back
+		{"I'll rerun the suite after the rebase. The rebase went through. go test passes now.", ""},
+		{"I'll check foo.go now. foo.go is fine. bar.go has the fix.", ""},
+		{"The run is green. checking the logs next.", "The run is green. checking the logs next."},
 	}
 	for _, c := range cases {
 		if got := Promise(Words(c.words)); got != c.quote {
@@ -115,27 +121,34 @@ func TestPromiseFindsWorkLeftForLater(t *testing.T) {
 	// that waits for the owner reads as a promise once "If you approve it," or "Say the word" is cut. It is none.
 	long := strings.Repeat("The report lists every table and its row count. ", 6)
 	for _, c := range []struct{ end, tail, quote string }{
-		{"Say the word on either and I'll make the change to the staging rule and to the ads.", "nd I'll make", ""},
-		{"If you approve it, I'll build the checklist page and both of the ads in two languages.", "ve it, I'll build", ""},
+		{"Say the word on either and I'll make the change to the staging rule and to the ads.", "the word on either and I'll make", ""},
+		{"If you approve it, I'll build the checklist page and both of the ads in two languages.", "approve it, I'll build", ""},
 		// the rest of a cut sentence is cut with it, whatever marks it holds
-		{"If you approve the plan (v2.1), I'll build the checklist page and both ads in two languages.", "v2.1), I'll build", ""},
-		{"If you want it, I can also change internal/report/table.go and then I'll run the import again.", "table.go and then I'll run", ""},
+		{"If you approve the plan (v2.1), I'll build the checklist page and both ads in two languages.", "ve the plan (v2.1), I'll build", ""},
+		{"If you want it, I can also change internal/report/table.go and then I'll run the import again.", ", I can also change internal/report/table.go and then I'll run", ""},
 		// a capital letter is no start of a sentence: the cut fell on "I'll" here
-		{"If you approve it, I'll build the checklist page and both of the ads in two languages, as planned.", "… I'll build", ""},
-		// a sentence that fills the tail to the byte reads the same, and is lost
-		{"I'll report the three row counts as soon as the import of the last table is run.", "… I'll report", ""},
-		// a tail that begins with the mark that ended the sentence before it is read whole
-		{"I'll report the three row counts as soon as the import of the last table ends.", "… . I'll report", "I'll report the three row counts as soon as the import of the last table ends."},
-		// a whole sentence after the cut one is read as before
-		{"The long export step that started this morning has now finished without any error at all. I'll check back at 14:10.", "all. I'll check", "I'll check back at 14:10."},
+		{"If you approve it, I'll build the checklist page and both of the ads in two languages, as planned.", "I'll build the checklist", ""},
+		// a sentence that fills the kept end to the byte reads the same, and is lost
+		{"I'll report the three row counts as soon as the import of the last table is run.", "I'll report the three", ""},
+		// a kept end that opens with the mark that closed the sentence before: that mark is its first sentence
+		{"I'll report the three row counts as soon as the import of the last table ends.", ". I'll report the three", "I'll report the three row counts as soon as the import of the last table ends."},
+		// a whole sentence after the cut one is read as before, the last and the one before it
+		{"The long export step that started this morning has now finished without any error at all. I'll check back at 14:10.", "his morning has now", "I'll check back at 14:10."},
+		{"The export of every table ran without one error. I'll check back at 14:10. The run is green so far.", "table ran without one error. I'll check", "I'll check back at 14:10."},
+		// a question before the promise is an ask, cut or not
+		{"Was it the staging rule that you meant by the note in the plan? I'll check back on it at 14:10.", "ing rule that you meant", ""},
 	} {
 		words := Words(long + c.end)
-		if !strings.Contains(words, c.tail) || strings.Contains(words, "Say the word") || strings.Contains(words, "If you") {
-			t.Fatalf("setup: the words were not cut where the case says (%q): %q", c.tail, words)
+		if !strings.HasPrefix(tail(words), c.tail) || !strings.Contains(words, "… ") {
+			t.Fatalf("setup: the kept end does not begin %q: %q", c.tail, tail(words))
 		}
 		if got := Promise(words); got != c.quote {
 			t.Errorf("Promise(cut %q) = %q, want %q", c.end, got, c.quote)
 		}
+	}
+	// a kept end that opens with a question's mark: the sentence before asked
+	if got := Promise("The report lists every table.… ? I'll check back at 14:10."); got != "" {
+		t.Errorf("a kept end after a question = %q", got)
 	}
 }
 
@@ -147,11 +160,25 @@ func TestSentencesEndAtAMarkAndASpace(t *testing.T) {
 		"Two shapes (e.g. a table) work. Pick one": {"Two shapes (e.g. a table) work.", "Pick one"},
 		"He said \"stop.\" Then it ran!  Really?":  {"He said \"stop.\"", "Then it ran!", "Really?"},
 		"**Landed.** `x.go` is in.":                {"**Landed.**", "`x.go` is in."},
+		"The run is green. go test passes now.":    {"The run is green. go test passes now."},
 		"  ":                                       nil,
 	} {
 		if got := sentences(text); !slices.Equal(got, want) {
 			t.Errorf("sentences(%q) = %q, want %q", text, got, want)
 		}
+	}
+	if got, want := pieces("The run is green. go test passes (e.g. on v2.1) now."), []string{"The run is green.", "go test passes (e.g.", "on v2.1) now."}; !slices.Equal(got, want) {
+		t.Errorf("pieces = %q, want %q", got, want)
+	}
+	// an ask keeps the sentence it hangs on: a file's name after the question does not push it out of the last two
+	if got := Asked("Should I also update README.md? I've left config.yaml as is. The rest is in."); got != "" {
+		t.Errorf("an ask three sentences back = %q", got)
+	}
+	if got, want := Asked("The rest is in. Should I also update README.md? I've left config.yaml as is."), "Should I also update README.md?"; got != want {
+		t.Errorf("Asked = %q, want %q", got, want)
+	}
+	if got, want := Question("The rest is in. Should I also update README.md? I've left config.yaml as is."), "Should I also update README.md?"; got != want {
+		t.Errorf("Question = %q, want %q", got, want)
 	}
 }
 

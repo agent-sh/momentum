@@ -90,10 +90,18 @@ func tail(words string) string {
 var reSentenceEnd = regexp.MustCompile("[.!?]+[\"'”’)\\]*_`]*\\s+")
 
 // sentences splits a text where its sentences end: at a mark that a space follows, when what comes next does not
-// begin with a small letter, and at the end. A mark inside a token ("v2.1", "config.yaml", "docs/plan.md") ends
-// nothing, and neither does an abbreviation's ("e.g. two columns"): the rest would read as a sentence of its own,
-// without what it hangs on.
-func sentences(text string) []string {
+// begin with a small letter, and at the end. A mark with no space after it ("v2.1", "config.yaml", "docs/plan.md")
+// ends nothing, and neither does one that small letters follow ("e.g. two columns"): the rest would read as a
+// sentence of its own, without what it hangs on. A sentence that opens with a small letter (a file's or a command's
+// name) so joins the one before it, which only widens what a reader of asks sees.
+func sentences(text string) []string { return split(text, false) }
+
+// pieces splits a text at every mark that a space follows, whatever comes next: the sentences, with one that opens
+// with a small letter on its own. A promise is looked for in the last two of these, so that a sentence joined to
+// the one before does not reach further back for one.
+func pieces(text string) []string { return split(text, true) }
+
+func split(text string, every bool) []string {
 	var out []string
 	add := func(s string) {
 		if s = strings.TrimSpace(s); s != "" {
@@ -102,7 +110,7 @@ func sentences(text string) []string {
 	}
 	start := 0
 	for _, m := range reSentenceEnd.FindAllStringIndex(text, -1) {
-		if r, _ := utf8.DecodeRuneInString(text[m[1]:]); unicode.IsLower(r) {
+		if r, _ := utf8.DecodeRuneInString(text[m[1]:]); !every && unicode.IsLower(r) {
 			continue
 		}
 		add(text[start:m[1]])
@@ -162,43 +170,42 @@ func Question(text string) string {
 // check when something finishes, a wait it says it is in, or a step it announced and did not take. "" when the
 // words end the work, ask the owner, or say nothing of the kind.
 //
-// A sentence whose start the store cut is no promise: what it hangs on may be in the part that is gone ("If you
-// approve it, I'll build the page" kept as "ve it, I'll build the page"), so it cannot be told from an offer that
-// waits for the owner.
+// The first sentence of a kept end is no promise: the store may have cut its start, and what it hangs on may be in
+// the part that is gone ("If you approve it, I'll build the page" kept as "ve it, I'll build the page"), so it
+// cannot be told from an offer that waits for the owner. A kept end that opens with the mark that closed the
+// sentence before has that mark as its first sentence. The promise is looked for in the last two pieces of the
+// kept end and quoted as the sentence that holds it.
 func Promise(words string) string {
 	if AsksOwner(words) {
 		return ""
 	}
-	ss := lastSentences(words, 2)
-	if len(ss) > 0 && reFinal.MatchString(ss[len(ss)-1]) {
+	if ss := lastSentences(words, 2); len(ss) > 0 && reFinal.MatchString(ss[len(ss)-1]) {
 		return ""
 	}
-	first := 0
-	if cutInside(words) && len(sentences(tail(words))) <= len(ss) {
-		first = 1 // the first of them is the tail's first sentence, and its start is gone
+	ss := sentences(tail(words))
+	first, left := 0, 2
+	if cutInside(words) {
+		first = 1
 	}
-	for i := len(ss) - 1; i >= first; i-- {
-		if rePromise.MatchString(ss[i]) || reStep.MatchString(ss[i]) {
-			return ss[i]
+	for i := len(ss) - 1; i >= first && left > 0; i-- {
+		ps := pieces(ss[i])
+		for j := len(ps) - 1; j >= 0 && left > 0; j, left = j-1, left-1 {
+			if rePromise.MatchString(ps[j]) || reStep.MatchString(ps[j]) {
+				return ss[i]
+			}
 		}
 	}
 	return ""
 }
 
-// reWholeTail is a tail that begins with the end of the sentence before it: its first sentence is whole.
-var reWholeTail = regexp.MustCompile("^[.!]+[\"'”’)\\]*_`]*\\s")
-
-// cutInside reports words the store cut inside a sentence, so that the first sentence of their tail lacks its
-// start. A tail is known to begin where a sentence does only when it opens with the mark that ended the one before:
-// a capital letter says nothing ("…, I'll build" begins with one too), and a question mark says the sentence before
-// asked something this one may answer to. A promise whose sentence fills the tail to the byte is lost with them.
+// cutInside reports words the store cut, whose kept end is not their start (tail): the first sentence of that end
+// may lack its start. Nothing in the end says whether it does: a capital letter begins "…, I'll build" too. So a
+// promise whose sentence the cut fell in, or that fills the kept end to the byte, is lost; and so is one after an
+// agent's own "… " in words kept whole, which reads as the store's.
 func cutInside(words string) bool {
 	words = reTrailer.ReplaceAllString(words, " ")
 	i := strings.LastIndex(words, "… ")
-	if i < 0 || tail(words) == strings.TrimSpace(words[:i]) {
-		return false // kept whole, or the tail is the start (the end was a harness's trailer)
-	}
-	return !reWholeTail.MatchString(tail(words))
+	return i >= 0 && tail(words) != strings.TrimSpace(words[:i])
 }
 
 var (
