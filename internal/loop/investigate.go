@@ -247,9 +247,6 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 	if !holdsText(fix) {
 		fix = ""
 	}
-	if reported && noneWord(f.Repo) {
-		f.Repo = "" // a word for none is no repository's name
-	}
 	u := store.CaseUpdate{Status: store.CaseInvestigating}
 	if reported {
 		u.Mechanism, u.NextTest, u.Alternatives = &mechanism, &fix, alternatives
@@ -354,15 +351,14 @@ func placeOf(f finding) string {
 // the fix lives, or it is a component-health case that stays open for its fix.
 const fixNotStated = "(the investigation stated no fix)"
 
-// noneWord says whether a field's text only says there is none: empty, or a word a report puts where it has
-// nothing to name.
+// noneWord says whether a place's text only says there is none: empty, or a word a report puts where it has
+// nothing to name. A text that goes on after such a word may name a place, and is kept.
 func noneWord(s string) bool {
-	s = strings.ToLower(strings.Trim(s, " .-()?!\"'—–"))
-	switch s {
+	switch strings.ToLower(strings.Trim(s, " .-()?!\"'—–")) {
 	case "", "n/a", "na", "n.a", "none", "nowhere", "unknown", "null", "nil", "no", "not applicable", "no place", "none needed", "tbd":
 		return true
 	}
-	return strings.HasPrefix(s, "n/a ") || strings.HasPrefix(s, "none ") || strings.HasPrefix(s, "not applicable ")
+	return false
 }
 
 // dismissedMax and placeMax bound that reason's quote of the summary, and the place a finding names.

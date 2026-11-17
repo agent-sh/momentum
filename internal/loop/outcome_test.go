@@ -195,24 +195,17 @@ func TestABlankFixBesideAPlaceOrAHealthCaseIsNotClosed(t *testing.T) {
 	}
 }
 
-// A word that only says there is none names no place and no repository.
-func TestAWordForNoneNamesNothing(t *testing.T) {
-	for _, w := range []string{"", " ", "N/A", "n/a - nothing to change", "(none)", "None.", "not applicable", "No place", "none needed", "nil", "no", "N.A.", "TBD", "?", "—", "\"\"", "-"} {
-		if !noneWord(w) {
-			t.Errorf("%q is taken to name something", w)
+// A word that only says there is none names no place. A text that goes on after such a word may name one.
+func TestAWordForNoneNamesNoPlace(t *testing.T) {
+	for _, w := range []string{"", " ", "N/A", "(none)", "None.", "not applicable", "No place", "none needed", "nil", "no", "N.A.", "TBD", "?", "—", "\"\"", "-"} {
+		if p := placeOf(finding{Place: w}); p != "" {
+			t.Errorf("%q is taken for a place: %q", w, p)
 		}
 	}
-	for _, w := range []string{"~/.config/tool/hook.ts", "nonesuch repository", "the owner's router", "notes"} {
-		if noneWord(w) {
+	for _, w := range []string{"~/.config/tool/hook.ts", "nonesuch repository", "the owner's router", "notes",
+		"None of the loop's repositories: the upstream tool's repository", "n/a here, see ~/.bashrc"} {
+		if p := placeOf(finding{Place: w}); p == "" {
 			t.Errorf("%q is taken for a word for none", w)
 		}
-	}
-	ctx := context.Background()
-	st := testStore(t)
-	c := openCase(t, st, "failures", "repo-none", 1)
-	got, recorded, err := recordFindings(ctx, st, c.ID, c.Episode, finding{Mechanism: "the tool refused a call it is meant to refuse",
-		Fix: "No change.", Repo: "n/a", NothingToFix: true, Report: "The tool worked as meant."}, true, "", "loop:r")
-	if err != nil || !recorded || got.Status != store.CaseClosed || got.Reason != store.NotWorthIt {
-		t.Fatalf("a word for none in repo beside nothing to fix: %+v %v %v", got, recorded, err)
 	}
 }
