@@ -459,3 +459,38 @@ func TestARunWhoseBrokerIsUnreachableIsNotTheAgentsFailure(t *testing.T) {
 		}
 	}
 }
+
+// Among cases at the same stage the pick takes the one with the most evidence no run has read. A case that was
+// investigated, closed and came back on one new event holds more evidence in all, and goes after a case whose
+// events nobody looked at.
+func TestThePickPrefersEvidenceNoRunHasRead(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	old := openCase(t, st, "failures", "long-history", 30)
+	run, why := r.reserve(ctx, old.Family, old.ID, StepInvestigate)
+	if why != "" {
+		t.Fatal(why)
+	}
+	r.completeStep(ctx, old, run, Result{Started: true, CostKnown: true, Status: store.RunFailed, Failure: "investigate run"}, nil)
+	if _, err := st.CloseCase(ctx, old.ID, store.Solved, "", "fixed by hand", "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond) // the new event comes in after the run began and the case closed
+	back, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "long-history", Title: "case long-history",
+		Evidence: []store.Evidence{{Ref: "file:/t/long-history-again", At: time.Now()}}}, "test")
+	if err != nil || back.ID != old.ID || back.Status != store.CaseOpen || back.Evidence != 31 {
+		t.Fatalf("setup: the old case comes back on one event: %+v %v", back, err)
+	}
+	fresh := openCase(t, st, "failures", "nobody-looked", 5)
+	if n, err := st.UnseenEvidence(ctx, old.ID); err != nil || n != 1 {
+		t.Fatalf("the old case's unread evidence: %d %v", n, err)
+	}
+	if n, err := st.UnseenEvidence(ctx, fresh.ID); err != nil || n != 5 {
+		t.Fatalf("the new case's unread evidence: %d %v", n, err)
+	}
+	picked, _, _, err := r.pick(ctx, "failures", "", false)
+	if err != nil || picked.ID != fresh.ID {
+		t.Fatalf("picked %s (%v), want the case nobody looked at, %s", picked.ID, err, fresh.ID)
+	}
+}

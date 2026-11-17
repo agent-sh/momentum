@@ -831,9 +831,10 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 
 // candidate is a case a family's pick may run, with its step.
 type candidate struct {
-	c    store.Case
-	step string
-	rank int
+	c      store.Case
+	step   string
+	rank   int
+	unseen int // the evidence no run of it has read
 }
 
 func (c candidate) why() string {
@@ -1087,7 +1088,11 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 			passed = append(passed, c.ID+" stopped: "+stop)
 			continue
 		}
-		cands = append(cands, candidate{c, step, rank})
+		unseen, err := r.Store.UnseenEvidence(ctx, c.ID)
+		if err != nil {
+			return nil, "", err
+		}
+		cands = append(cands, candidate{c, step, rank, unseen})
 	}
 	if len(cands) == 0 {
 		why := "no case to work"
@@ -1100,6 +1105,11 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 		a, b := cands[i], cands[j]
 		if a.rank != b.rank {
 			return a.rank > b.rank
+		}
+		// What no run has read comes first: a case that came back on one event after a long history does not go
+		// before one with many events nobody looked at.
+		if a.unseen != b.unseen {
+			return a.unseen > b.unseen
 		}
 		if a.c.Evidence != b.c.Evidence {
 			return a.c.Evidence > b.c.Evidence
