@@ -288,7 +288,7 @@ func TestAnInvestigationNamesAConfigurationTarget(t *testing.T) {
 	if r.investigationSchemaFor(off) != investigationSchema || strings.Contains(investigationSchema, "config") {
 		t.Fatal("the schema offers config while configuration targets are off")
 	}
-	if q := r.investigationQuestion(off); q != liveQuestion || strings.Contains(q, "/ro/config") {
+	if q := r.investigationQuestion(off); q != liveQuestion+ownReachQuestion() || strings.Contains(q, "/ro/config") {
 		t.Fatalf("the question names a configuration file while configuration targets are off: %s", q)
 	}
 	r.Ship = &Ship{ConfigTargets: ConfigTargets{Enabled: true}}

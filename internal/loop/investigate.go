@@ -40,9 +40,19 @@ func (r *Runner) investigationSchemaFor(c store.Case) string {
 // configuration targets are on (configTargetsFor).
 func (r *Runner) investigationQuestion(c store.Case) string {
 	if r.configTargetsFor(c) {
-		return liveQuestion + configQuestion
+		return liveQuestion + ownReachQuestion() + configQuestion
 	}
-	return liveQuestion
+	return liveQuestion + ownReachQuestion()
+}
+
+// ownReachQuestion tells a live investigation which paths of the loop's own repository no build may change (the
+// gate's own lists), so that a fix that needs one is reported as a place and waits for a person with the path
+// named, instead of a build that is paid for only to answer that its fix is out of reach.
+func ownReachQuestion() string {
+	return " In the loop's own repository (" + SelfRepo + ", under whichever NAME /ro/repos holds it), no build may change CI configuration (" +
+		strings.Join(ciPaths, ", ") + ") or these paths, which the loop's measurement and its event scanners rest on: " +
+		strings.Join(ProposalProtected(), ", ") + " (of internal/supervise/, rules.go and test files may change). " +
+		"A fix that needs one of them is not the loop's to build: report place as that path in the repository, and no repo."
 }
 
 // configTargetsFor says an investigation of a case may name a configuration file: configuration targets are on, and

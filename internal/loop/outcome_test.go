@@ -209,3 +209,20 @@ func TestAWordForNoneNamesNoPlace(t *testing.T) {
 		}
 	}
 }
+
+// A live investigation is told which paths of the loop's own repository no build may change, in the gate's own
+// words, and to report a fix that needs one as a place. The evaluation's question is the plain one.
+func TestAnInvestigationIsToldWhatNoBuildMayChange(t *testing.T) {
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "own-reach", 1)
+	q := r.investigationQuestion(c)
+	for _, want := range append(append([]string{SelfRepo, "report place as that path"}, ProposalProtected()...), ciPaths...) {
+		if !strings.Contains(q, want) {
+			t.Errorf("the question does not name %q", want)
+		}
+	}
+	if !strings.HasPrefix(q, liveQuestion) || strings.Contains(liveQuestion, SelfRepo) {
+		t.Fatalf("the plain question changed, or is not where the live one begins")
+	}
+}
