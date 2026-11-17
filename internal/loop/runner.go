@@ -1052,6 +1052,16 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 				continue
 			} else if err != nil {
 				return nil, "", err
+			} else if root, ferr := followsOf(ctx, r.Store, c); ferr != nil {
+				return nil, "", ferr
+			} else if repo == "" && target == "" && root != "" {
+				// its cause is another case's: no build here, and what becomes of it is read from that case
+				line, ferr := r.follow(ctx, c, root, dry)
+				if ferr != nil {
+					return nil, "", ferr
+				}
+				passed = append(passed, line)
+				continue
 			} else if repo == "" && target == "" {
 				if !dry {
 					r.keepHold(ctx, c, repoHold(place), true)

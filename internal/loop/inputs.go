@@ -301,7 +301,13 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 		return run, err
 	}
 	question := r.investigationQuestion(c)
-	prompt := fmt.Sprintf("%s\nProblem: %s\n%s%s%s%s", question, plain.Line(c.Title), evidenceText, caseHolds(c), findingsInstruction, inputReference(true))
+	siblings := ""
+	if step == StepInvestigate {
+		if siblings, err = siblingsText(ctx, r.Store, c); err != nil {
+			return run, err
+		}
+	}
+	prompt := fmt.Sprintf("%s\nProblem: %s\n%s%s%s%s%s", question, plain.Line(c.Title), evidenceText, caseHolds(c), siblings, findingsInstruction, inputReference(true))
 	schema := r.investigationSchemaFor(c)
 	extra := map[string]string{}
 	if step == StepBuild {

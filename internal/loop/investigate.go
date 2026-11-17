@@ -23,7 +23,7 @@ The owner's words are only what his own turns say (actor owner); never credit hi
 const investigationSchema = `{"type":"object","additionalProperties":false,"required":["mechanism","fix","summary"],
 "properties":{"mechanism":{"type":"string"},"alternatives":{"type":"array","items":{"type":"string"}},
 "fix":{"type":"string"},"summary":{"type":"string"},"repo":{"type":"string"},
-"place":{"type":"string"},"nothing_to_fix":{"type":"boolean"}}}`
+"place":{"type":"string"},"nothing_to_fix":{"type":"boolean"},"same_as":{"type":"string"}}}`
 
 // investigationConfigSchema is an investigation's report while configuration targets are on: it may name a config.
 var investigationConfigSchema = strings.Replace(investigationSchema, `"repo":{"type":"string"}`, `"repo":{"type":"string"},"config":{"type":"string"}`, 1)
@@ -261,6 +261,24 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 	if !holdsText(fix) {
 		fix = ""
 	}
+	// A report that names another case as the holder of this case's cause, and no place of its own to build in:
+	// the case follows that one when the root rule allows it (rootFor), and the report's place is then no hold.
+	follows, notTaken := "", ""
+	if reported && mechanism != "" && f.Repo == "" && f.Config == "" && holdsText(f.SameAs) {
+		c, err := st.CaseByID(ctx, caseID)
+		if err != nil {
+			return store.Case{}, false, err
+		}
+		if follows, notTaken, err = rootFor(ctx, st, c, f.SameAs); err != nil {
+			return store.Case{}, false, err
+		}
+		if follows != "" {
+			f.Place, f.NothingToFix = "", false
+			if fix == "" {
+				fix = followsFix // a case in testing says what its fix is
+			}
+		}
+	}
 	u := store.CaseUpdate{Status: store.CaseInvestigating}
 	if reported {
 		u.Mechanism, u.NextTest, u.Alternatives = &mechanism, &fix, alternatives
@@ -338,12 +356,16 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 			Repo    string `json:"repo"`
 			Config  string `json:"config,omitempty"`
 			Place   string `json:"place,omitempty"`
+			Follows string `json:"follows,omitempty"`
 			Episode int64  `json:"episode"`
-		}{f.Repo, f.Config, place, episode})
+		}{f.Repo, f.Config, place, follows, episode})
 		if err != nil {
 			return store.Case{}, false, err
 		}
 		notes = append(notes, store.CaseEntry{Action: repoAction, Detail: string(raw)})
+		if notTaken != "" {
+			notes = append(notes, store.CaseEntry{Action: notTakenAction, Detail: notTaken})
+		}
 	}
 	return st.RecordFindings(ctx, caseID, episode, u, actor, notes...)
 }
@@ -449,6 +471,8 @@ type finding struct {
 	// worth making anywhere.
 	Place        string `json:"place,omitempty"`
 	NothingToFix bool   `json:"nothing_to_fix,omitempty"`
+	// SameAs is the case whose cause the investigation found this case's cause to be (follows.go).
+	SameAs string `json:"same_as,omitempty"`
 }
 
 // nativeFinding reads an investigation's report; alternatives given as one text, not the schema's list, are kept.
@@ -458,13 +482,14 @@ func nativeFinding(res Result) finding {
 		Alternatives       json.RawMessage
 		Fix, Summary, Repo string
 		Config, Place      string
-		NothingToFix       bool `json:"nothing_to_fix"`
+		NothingToFix       bool   `json:"nothing_to_fix"`
+		SameAs             string `json:"same_as"`
 	}
 	if json.Unmarshal(res.Report, &rep) != nil {
 		return finding{}
 	}
 	f := finding{Mechanism: rep.Mechanism, Fix: rep.Fix, Report: rep.Summary, Repo: rep.Repo, Config: rep.Config,
-		Place: rep.Place, NothingToFix: rep.NothingToFix}
+		Place: rep.Place, NothingToFix: rep.NothingToFix, SameAs: rep.SameAs}
 	if json.Unmarshal(rep.Alternatives, &f.Alternatives) != nil {
 		var one string
 		if json.Unmarshal(rep.Alternatives, &one) == nil && strings.TrimSpace(one) != "" {

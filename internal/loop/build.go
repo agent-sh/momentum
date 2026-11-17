@@ -330,6 +330,14 @@ func waitingRepoNote(c store.Case, hold string, at time.Time) store.Note {
 	n := store.Note{ID: repoNoteID(c.ID), Kind: store.NoteProblem, Importance: store.ImportanceLow,
 		Title:  "The loop's case " + c.ID + " waits for a repository",
 		Detail: "The investigation named no code repository or configuration file. The case stays in testing without a build run.", At: at}
+	if rest, ok := strings.CutPrefix(hold, followPrefix); ok {
+		// nothing here is a person's to do: the note says where the fix is built and what ends the wait
+		root, _, _ := strings.Cut(rest, ":")
+		n.Title = "The loop's case " + c.ID + " follows case " + root + ": one cause"
+		n.Detail = "Its investigation found the cause that case " + root + " holds. The fix is built under that case, and none here. " +
+			"When case " + root + " closes with its problem gone, this case closes with it; when it closes any other way, this case is investigated again."
+		return n
+	}
 	if place, ok := strings.CutPrefix(hold, elsewherePrefix); ok {
 		n.Title = plainClip("The fix for case "+c.ID+" is outside the loop's reach: "+place, 120)
 		if strings.Contains(place, SelfRepo) {
