@@ -4,6 +4,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/agent-sh/momentum/sessions"
 )
@@ -146,6 +148,11 @@ func Question(text string) string {
 // Promise returns the sentence of the last words that says the turn left work for later: a promise to report or
 // check when something finishes, a wait it says it is in, or a step it announced and did not take. "" when the
 // words end the work, ask the owner, or say nothing of the kind.
+//
+// Two sentences are never a promise. One whose start the store cut: what it hangs on may be in the part that is gone
+// ("If you approve it, I'll build the page" kept as "ve it, I'll build the page"), so it cannot be told from an offer
+// that waits for the owner. And one that waits on another session's word ("waiting for NAME's answer", "when NAME
+// says it has"): that session's message opens a turn, so something will wake it.
 func Promise(words string) string {
 	if AsksOwner(words) {
 		return ""
@@ -154,12 +161,47 @@ func Promise(words string) string {
 	if len(ss) > 0 && reFinal.MatchString(ss[len(ss)-1]) {
 		return ""
 	}
+	cut := cutSentence(words)
 	for i := len(ss) - 1; i >= 0; i-- {
+		if ss[i] == cut || waitsOnPeer(ss[i]) {
+			continue
+		}
 		if rePromise.MatchString(ss[i]) || reStep.MatchString(ss[i]) {
 			return ss[i]
 		}
 	}
 	return ""
+}
+
+// cutSentence is the first sentence of the words' tail when the store cut the words inside it, so that the
+// sentence lacks its start: the tail begins with a small letter, a digit or a mark, as the middle of a sentence
+// does. "" for words kept whole, and for a tail that begins as a sentence does.
+func cutSentence(words string) string {
+	words = reTrailer.ReplaceAllString(words, " ")
+	if !strings.Contains(words, "… ") || tail(words) == strings.TrimSpace(words[:strings.LastIndex(words, "… ")]) {
+		return "" // kept whole, or the tail is the start (the end was a harness's trailer)
+	}
+	// the cut may fall on the end of the sentence before: its mark and the space after it are not this one's start
+	t := strings.TrimLeft(tail(words), ".!? ")
+	if r, _ := utf8.DecodeRuneInString(t); unicode.IsUpper(r) {
+		return "" // the tail begins where a sentence does: nothing of its first sentence reads as missing
+	}
+	if ss := lastSentences(words, 1<<30); len(ss) > 0 {
+		return ss[0]
+	}
+	return ""
+}
+
+// rePeerWait is a wait on another session's word, by its name: its answer, or its saying something.
+var rePeerWait = regexp.MustCompile(`(?i)\bwaiting (?:for|on) ([\w-]+)(?:'s|’s) (?:answer|reply|response|message|word|go-ahead|ok|review)\b|\b(?:when|once|after|until) ([\w-]+) (?:says|replies|answers|confirms|responds|agrees|reports back)\b`)
+
+// notANamedPeer are the words that stand where a session's name would and name none: the work itself, the owner.
+var notANamedPeer = map[string]bool{"it": true, "they": true, "that": true, "this": true, "the": true, "he": true, "she": true, "you": true, "i": true, "we": true, "everything": true, "anyone": true, "someone": true}
+
+// waitsOnPeer reports a sentence that waits on another session's word.
+func waitsOnPeer(sentence string) bool {
+	m := rePeerWait.FindStringSubmatch(sentence)
+	return m != nil && !notANamedPeer[strings.ToLower(firstNonEmpty(m[1], m[2]))]
 }
 
 var (
