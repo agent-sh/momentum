@@ -255,11 +255,18 @@ type launch struct {
 	Summary    string `json:"summary"`
 	Background string `json:"backgroundTaskId"`
 	Agent      string `json:"agentId"`
+	// Error is why a workflow did not start (its script did not compile): the record still says async_launched and
+	// names a task id, and no task was made.
+	Error string `json:"error"`
 }
 
 // UnmarshalJSON reads a launch where the record holds one: a tool's result there is often a string or a list, which
-// is no launch and no error.
+// is no launch and no error. A record that names neither a background task nor a launch is not decoded: most are a
+// file's text or a command's output, and large.
 func (l *launch) UnmarshalJSON(raw []byte) error {
+	if !bytes.Contains(raw, []byte(`"backgroundTaskId"`)) && !bytes.Contains(raw, []byte(`"async_launched"`)) {
+		return nil
+	}
 	type plain launch
 	var v plain
 	if json.Unmarshal(raw, &v) == nil {
@@ -906,8 +913,11 @@ func (t *Tracker) result(b block, at time.Time, started *launch) {
 		}
 	case c.Name == "Bash" && started != nil && reTaskName.MatchString(started.Background):
 		// its record names the task and its text does not open as a launch's does: a command moved to the
-		// background when its time ran out, or one run inside another tool's call
-		add(started.Background, "bash")
+		// background (its time ran out, its user moved it, its turn was cut), or one run inside another tool's call
+		k := add(started.Background, "bash")
+		if m := reOutFile.FindStringSubmatch(out); m != nil {
+			k.Output = m[1] + ".output"
+		}
 	case c.Name == "Agent" || c.Name == "Task":
 		if m := reAgentID.FindStringSubmatch(out); m != nil && strings.HasPrefix(out, "Async agent launched") {
 			add(m[1], "agent")
@@ -919,9 +929,10 @@ func (t *Tracker) result(b block, at time.Time, started *launch) {
 		if i := strings.Index(out, "Summary: "); i >= 0 {
 			k.Label = text.OneLine(strings.SplitN(out[i+9:], "\n", 2)[0], 120)
 		}
-	case c.Name == "Workflow" && started != nil && started.Status == "async_launched" && reTaskName.MatchString(started.TaskID):
-		// the launch is in the record and the result's text is empty: without it the run is no task, and a session
-		// that waits on its workflow reads as one with nothing in flight
+	case c.Name == "Workflow" && started != nil && started.Status == "async_launched" && started.Error == "" && reTaskName.MatchString(started.TaskID):
+		// the launch is in the record and the result's text does not say it (a call inside another tool's run has
+		// none): without it the run is no task, and a session that waits on its workflow reads as one with nothing
+		// in flight
 		k := add(started.TaskID, "workflow")
 		if started.Summary != "" {
 			k.Label = text.OneLine(started.Summary, 120)

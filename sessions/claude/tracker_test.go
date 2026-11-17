@@ -233,7 +233,7 @@ func TestWorkflowsAndMonitors(t *testing.T) {
 // A workflow whose launch is only in its result's record, the result's text empty, is a task all the same, until
 // its notification says it ended. A record that holds another tool's result there, or a launch that did not start,
 // is none.
-func TestAWorkflowLaunchedInItsRecordIsATask(t *testing.T) {
+func TestALaunchInItsResultsRecordIsATask(t *testing.T) {
 	launched := func(x *script, id string, record any) *script {
 		return x.add(map[string]any{"type": "user", "toolUseResult": record, "message": map[string]any{"content": []any{
 			map[string]any{"type": "tool_result", "tool_use_id": id, "content": ""}}}})
@@ -253,16 +253,40 @@ func TestAWorkflowLaunchedInItsRecordIsATask(t *testing.T) {
 	// a shell command whose record names its background task is one too, whatever its text says; and a record that
 	// holds a string or a list where a launch would be is read as any result: its text still starts a task
 	b := newScript(t).call("tu1", "Bash", map[string]any{"command": "make all"})
-	b = launched(b, "tu1", map[string]any{"stdout": "", "backgroundTaskId": "b77", "timedOutAfterMs": 120000})
+	b = b.add(map[string]any{"type": "user", "toolUseResult": map[string]any{"stdout": "", "backgroundTaskId": "b77"},
+		"message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tu1",
+			"content": "Command did not complete within 120000ms and was moved to the background with ID: b77. Output is being written to: /x/b77.output"}}}})
 	b = b.call("tu2", "Bash", map[string]any{"command": "make docs"}).add(map[string]any{"type": "user", "toolUseResult": "a string",
 		"message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tu2",
 			"content": "Command running in background with ID: b78. Output is being written to: /x/b78.output"}}}})
 	b = b.call("tu3", "Bash", map[string]any{"command": "make site"}).add(map[string]any{"type": "user", "toolUseResult": []any{"a", "list"},
 		"message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tu3",
 			"content": "Command running in background with ID: b79. Output is being written to: /x/b79.output"}}}}).say("They run.")
-	if s := b.facts(NewTracker(b.path), b.at); len(s.Tasks) != 3 || !strings.Contains(taskIDs(s), "bash:b77") || !strings.Contains(taskIDs(s), "bash:b78") ||
+	bt := NewTracker(b.path)
+	if s := b.facts(bt, b.at); len(s.Tasks) != 3 || !strings.Contains(taskIDs(s), "bash:b77") || !strings.Contains(taskIDs(s), "bash:b78") ||
 		!strings.Contains(taskIDs(s), "bash:b79") {
 		t.Fatalf("shell commands in the background: %s", taskIDs(s))
+	} else {
+		for id, k := range bt.st.Tasks {
+			if k.Output != "/x/"+id+".output" {
+				t.Errorf("task %s reads its output at %q", id, k.Output)
+			}
+		}
+	}
+	// a launch that both the text and the record name is one task, with what the text says of it
+	d := newScript(t).call("tu1", "Bash", map[string]any{"command": "make all"}).add(map[string]any{"type": "user",
+		"toolUseResult": map[string]any{"backgroundTaskId": "b80"}, "message": map[string]any{"content": []any{map[string]any{"type": "tool_result",
+			"tool_use_id": "tu1", "content": "Command running in background with ID: b80. Output is being written to: /x/b80.output"}}}})
+	d = d.call("tu2", "Workflow", map[string]any{"description": "fan out"}).add(map[string]any{"type": "user",
+		"toolUseResult": map[string]any{"status": "async_launched", "taskId": "wf80", "summary": "the record's"}, "message": map[string]any{"content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "tu2", "content": "Workflow launched in background. Task ID: wf80\nSummary: the text's"}}}}).say("Both run.")
+	dt := NewTracker(d.path)
+	if s := d.facts(dt, d.at); len(s.Tasks) != 2 || !strings.Contains(taskIDs(s), "bash:b80") || !strings.Contains(taskIDs(s), "workflow:wf80") {
+		t.Fatalf("a launch in the text and in the record: %s", taskIDs(s))
+	} else {
+		if b, w := dt.st.Tasks["b80"], dt.st.Tasks["wf80"]; b.Output != "/x/b80.output" || w.Label != "the text's" {
+			t.Errorf("each keeps what its text says: output %q, label %q", b.Output, w.Label)
+		}
 	}
 	// an agent's launch in the record alone is a task, and an agent that ran to its end in the call is none
 	g := newScript(t).call("tu1", "Agent", map[string]any{"description": "look", "prompt": "look"})
@@ -272,9 +296,8 @@ func TestAWorkflowLaunchedInItsRecordIsATask(t *testing.T) {
 		t.Fatalf("an agent launched in its record: %s", taskIDs(s))
 	}
 	y := newScript(t).call("tu1", "Workflow", map[string]any{"description": "fan out"})
-	y = launched(y, "tu1", map[string]any{"status": "failed", "taskId": "wf1"})
-	y = launched(y.call("tu2", "Workflow", map[string]any{"description": "again"}), "tu2", "a result that is text")
-	y = launched(y.call("tu3", "Workflow", map[string]any{"description": "again"}), "tu3", []any{"a", "list"})
+	// a workflow whose script did not compile: the record says launched, names an id and gives the error
+	y = launched(y, "tu1", map[string]any{"status": "async_launched", "taskId": "wf1", "error": "the script did not compile"})
 	y = launched(y.call("tu4", "Bash", map[string]any{"command": "true"}), "tu4", map[string]any{"status": "async_launched", "taskId": "b1"})
 	y = launched(y.call("tu6", "Read", map[string]any{"file_path": "/x"}), "tu6", map[string]any{"backgroundTaskId": "r1"})
 	y = launched(y.call("tu5", "Workflow", map[string]any{"description": "odd id"}), "tu5", map[string]any{"status": "async_launched", "taskId": "not an id"}).say("Done.")
