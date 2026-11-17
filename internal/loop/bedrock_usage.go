@@ -23,8 +23,37 @@ type relayUsage struct {
 		Hour int64 `json:"ephemeral_1h_input_tokens"`
 	} `json:"cache_creation"`
 	// Iterations are the sampling passes of one response, each with its own usage. The top-level counts leave
-	// out a pass the provider ran on its side (a compaction's), so what a response is billed is their sum.
-	Iterations []relayUsage `json:"iterations"`
+	// out a pass the provider ran on its side (a compaction's), so what a response is billed is their sum. They
+	// are kept as they came and read once, at the end (passes): decoding them in every event would hold many
+	// times their bytes.
+	Iterations json.RawMessage `json:"iterations"`
+}
+
+// A response lists a handful of passes. More than maxPasses, or more than maxPassBytes of them, is no usage the
+// relay prices: the reservation stands.
+const (
+	maxPasses    = 64
+	maxPassBytes = 64 << 10
+)
+
+// passes are a usage's iterations, or false when they are not a list of at most maxPasses valid usages.
+func (u relayUsage) passes() ([]relayUsage, bool) {
+	if len(u.Iterations) == 0 || string(u.Iterations) == "null" {
+		return nil, true
+	}
+	if len(u.Iterations) > maxPassBytes {
+		return nil, false
+	}
+	var list []relayUsage
+	if json.Unmarshal(u.Iterations, &list) != nil || len(list) > maxPasses {
+		return nil, false
+	}
+	for _, it := range list {
+		if !it.valid() {
+			return nil, false
+		}
+	}
+	return list, true
 }
 
 // price is what a usage costs at a rate, in dollars.
@@ -69,7 +98,7 @@ type usageParser struct {
 	want                      int
 	bad, eof, start, final    bool
 	usage                     relayUsage
-	iterations                []relayUsage // the last event's, when the response lists its passes
+	iterations                json.RawMessage // the last event's, when the response lists its passes
 	blocks                    map[int]*reportBlock
 	reports                   []json.RawMessage
 	reportBytes, pendingBytes int
@@ -260,26 +289,32 @@ func (p *usageParser) feed(b []byte) {
 
 // grow takes the input side of a later event's usage. The counts of a message_delta are cumulative: a response
 // that loaded more on the provider's side after its first event (tool definitions it searched for) says so there,
-// and the first event's counts are then less than what is billed. A count never goes down; a later event that
-// names none leaves the first event's.
+// and the first event's counts are then less than what is billed. No count goes down, the one-hour part of the
+// writes among them; a later event that names none leaves the first event's. A message_delta names the written
+// total without its split, so what the total grew by is priced as one-hour writes, the dearer kind, unless the
+// event's own split says more of them. An event whose counts make no sense leaves the usage as it was, unread.
 func (p *usageParser) grow(u relayUsage) {
+	if u.Read < 0 || u.Write < 0 || u.Cache.Hour < 0 || u.Cache.Five < 0 || u.Cache.Hour > u.Write || u.Input != nil && *u.Input < 0 {
+		p.bad = true
+		return
+	}
 	if u.Input != nil && *u.Input > *p.usage.Input {
 		p.usage.Input = u.Input
 	}
 	p.usage.Read = max(p.usage.Read, u.Read)
+	hour := max(p.usage.Cache.Hour, u.Cache.Hour)
 	if u.Write > p.usage.Write {
-		p.usage.Write, p.usage.Cache = u.Write, u.Cache
+		hour = max(hour, p.usage.Cache.Hour+u.Write-p.usage.Write)
+		p.usage.Write = u.Write
 	}
-	if len(u.Iterations) > 0 {
+	p.usage.Cache.Hour = min(hour, p.usage.Write)
+	if len(u.Iterations) > 0 && string(u.Iterations) != "null" {
 		p.iterations = u.Iterations
-	}
-	if u.Read < 0 || u.Write < 0 || u.Cache.Hour < 0 || u.Cache.Hour > u.Write || u.Input != nil && *u.Input < 0 {
-		p.bad = true
 	}
 }
 
 // known is what the input side of a response is known to cost though its usage was not read to the end: the
-// first event's counts, or nothing when there was none.
+// counts of its first event, raised by any later one that was read, or nothing when there was none.
 func (p *usageParser) known(r relayRate) float64 {
 	if !p.start || !p.usage.valid() {
 		return 0
@@ -334,11 +369,12 @@ func (p *usageParser) cost(r relayRate) (float64, bool) {
 	}
 	// A response that lists its passes is billed their sum, which the top-level counts can fall short of. The
 	// charge is the larger of the two readings, so neither shape of usage prices under the other.
+	list, ok := relayUsage{Iterations: p.iterations}.passes()
+	if !ok {
+		return 0, false
+	}
 	cost, passes := p.usage.price(r), 0.0
-	for _, it := range p.iterations {
-		if !it.valid() {
-			return 0, false
-		}
+	for _, it := range list {
 		passes += it.price(r)
 	}
 	return max(cost, passes), true

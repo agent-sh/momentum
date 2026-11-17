@@ -372,9 +372,10 @@ func TestTheChargeIsWhatTheResponsesUsageBills(t *testing.T) {
 		delta string
 		want  float64
 	}{
-		"output alone, as before":              {`{"output_tokens":100}`, .004 + .002 + .0004},
-		"more input by the end":                {`{"output_tokens":100,"input_tokens":5000}`, .02 + .002 + .0004},
-		"more read and written by the end":     {`{"output_tokens":100,"cache_read_input_tokens":12000,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_1h_input_tokens":400}}`, .004 + .002 + .0024 + .003 + .0032},
+		"output alone, as before": {`{"output_tokens":100}`, .004 + .002 + .0004},
+		"more input by the end":   {`{"output_tokens":100,"input_tokens":5000}`, .02 + .002 + .0004},
+		// a message_delta names the written total and no split: what it grew by is priced as one-hour writes
+		"more read and written by the end":     {`{"output_tokens":100,"cache_read_input_tokens":12000,"cache_creation_input_tokens":1000}`, .004 + .002 + .0024 + .008},
 		"less input named at the end":          {`{"output_tokens":100,"input_tokens":10,"cache_read_input_tokens":5}`, .004 + .002 + .0004},
 		"a compaction pass beside the message": {`{"output_tokens":100,"iterations":[{"type":"compaction","input_tokens":50000,"output_tokens":2000},{"type":"message","input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":2000}]}`, .2 + .04 + .004 + .002 + .0004},
 		"passes that sum to less than the top": {`{"output_tokens":100,"iterations":[{"type":"message","input_tokens":10,"output_tokens":1}]}`, .004 + .002 + .0004},
@@ -386,12 +387,34 @@ func TestTheChargeIsWhatTheResponsesUsageBills(t *testing.T) {
 			t.Errorf("%s: charged %f (%v), want %f", name, cost, ok, c.want)
 		}
 	}
+	// a first event with one-hour writes, and a last event whose total grew: no write is priced down to five minutes
+	hour := `{"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":20000,"cache_creation":{"ephemeral_1h_input_tokens":20000}}}}`
+	for name, c := range map[string]struct {
+		delta string
+		want  float64
+	}{
+		"a total that grew, with no split":  {`{"output_tokens":0,"cache_creation_input_tokens":20500}`, .164},
+		"a total that grew, split by 5m":    {`{"output_tokens":0,"cache_creation_input_tokens":20500,"cache_creation":{"ephemeral_5m_input_tokens":20500}}`, .164},
+		"the same total, a smaller 1h part": {`{"output_tokens":0,"cache_creation_input_tokens":20000,"cache_creation":{"ephemeral_1h_input_tokens":5}}`, .16},
+		"a smaller total":                   {`{"output_tokens":0,"cache_creation_input_tokens":100}`, .16},
+	} {
+		p := usageParser{stream: true}
+		p.feed(append(eventFrame([]byte(hour)), eventFrame([]byte(`{"type":"message_delta","usage":`+c.delta+`}`))...))
+		p.eof = true
+		if cost, ok := p.cost(rate); !ok || math.Abs(cost-c.want) > 1e-10 {
+			t.Errorf("%s: charged %f (%v), want %f", name, cost, ok, c.want)
+		}
+	}
 	// a pass with no counts, or a count below zero, is no usage to price: the reservation stands
 	for name, delta := range map[string]string{
-		"a pass with no counts":  `{"output_tokens":100,"iterations":[{"type":"compaction"}]}`,
-		"a count below zero":     `{"output_tokens":100,"cache_read_input_tokens":-1}`,
-		"more written per hour":  `{"output_tokens":100,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":20}}`,
-		"an input below nothing": `{"output_tokens":100,"input_tokens":-5}`,
+		"a pass with no counts":           `{"output_tokens":100,"iterations":[{"type":"compaction"}]}`,
+		"a count below zero":              `{"output_tokens":100,"cache_read_input_tokens":-1}`,
+		"more written per hour":           `{"output_tokens":100,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":20}}`,
+		"an input below nothing":          `{"output_tokens":100,"input_tokens":-5}`,
+		"a write below nothing":           `{"output_tokens":100,"cache_creation_input_tokens":-1}`,
+		"an hour below nothing":           `{"output_tokens":100,"cache_creation_input_tokens":5,"cache_creation":{"ephemeral_1h_input_tokens":-1}}`,
+		"passes that are no list":         `{"output_tokens":100,"iterations":{"type":"message"}}`,
+		"more passes than a response has": `{"output_tokens":100,"iterations":[` + strings.TrimSuffix(strings.Repeat(`{"input_tokens":1,"output_tokens":1},`, maxPasses+1), ",") + `]}`,
 	} {
 		p := usageParser{stream: true}
 		p.feed(append(eventFrame([]byte(start)), eventFrame([]byte(`{"type":"message_delta","usage":`+delta+`}`))...))
@@ -430,7 +453,15 @@ func TestAnUnreadResponseIsChargedNoLessThanItsKnownInput(t *testing.T) {
 			t.Errorf("%s: charged %f, want %f", name, cost, c.want)
 		}
 	}
-	if relayToolPrompt < 286 {
-		t.Errorf("the reservation's tool prompt, %d tokens, is under what the admitted models add", relayToolPrompt)
+	if relayToolPrompt < 804 {
+		t.Errorf("the reservation's tool prompt, %d tokens, is under the most the provider's table lists", relayToolPrompt)
+	}
+	// an event whose counts make no sense leaves what was read: the input its first event named is still charged
+	wire := append(eventFrame([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":400000}}}`)),
+		eventFrame([]byte(`{"type":"message_delta","usage":{"output_tokens":5,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":20}}}`))...)
+	r := budgetRelay(t, 1, func(req *http.Request) (*http.Response, error) { return brokerResponse(req, wire), nil })
+	relayRequest(r, strings.NewReader(body), "invoke-with-response-stream")
+	if cost, _, _, _ := r.accounting(); math.Abs(cost-(.08+.02)) > 1e-10 {
+		t.Errorf("an event with counts that make no sense: charged %f, want %f", cost, .08+.02)
 	}
 }

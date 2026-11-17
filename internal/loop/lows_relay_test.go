@@ -43,7 +43,7 @@ func TestTwoReportsInOneResponseVoidAnEarlierReport(t *testing.T) {
 func TestAnErrorAnswerReleasesItsReservation(t *testing.T) {
 	body := textRequestBody(10, 1000)
 	rate := relayRates["global.anthropic.claude-opus-5-5"]
-	reserve := (1000*rate.output + float64(len(body))*max(rate.input, rate.write1)) / 1e6
+	reserve := (1000*rate.output + float64(len(body)+relayToolPrompt)*max(rate.input, rate.write1)) / 1e6
 	var n atomic.Int64
 	r := budgetRelay(t, 1.2*reserve/1.5, func(req *http.Request) (*http.Response, error) {
 		if n.Add(1) == 1 {

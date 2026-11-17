@@ -175,7 +175,8 @@ var relayRates = map[string]relayRate{
 }
 
 // relayToolPrompt is the most tokens the provider's own system prompt for tool use adds to a request, by its
-// table of every model's (804 for a forced tool on an older model; the models the relay admits list 286).
+// table of every model's: 804, for a forced tool on an older model. Of the models the relay admits the table
+// lists two, at 286, and has no row for the third, so the table's largest stands for all.
 const relayToolPrompt = 804
 
 type relayCharge struct {
