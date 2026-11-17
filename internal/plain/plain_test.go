@@ -49,6 +49,7 @@ func TestKeptEndHoldsWholeSentences(t *testing.T) {
 		"the last two sentences":             {start + "The import ran. If you approve it, I'll build the page.", 20, 100, ". The import ran. If you approve it, I'll build the page."},
 		"a mark inside a token ends nothing": {start + "Plan v2.1 is in docs/plan.md now. I'll check config.yaml at 14:10.", 20, 100, ". Plan v2.1 is in docs/plan.md now. I'll check config.yaml at 14:10."},
 		"a question's mark opens the end":    {start + "Should I go on? The import ran. I'll check back.", 20, 100, "? The import ran. I'll check back."},
+		"an abbreviation ends no sentence":   {start + "Two shapes work. Pick one, e.g. the table.", 20, 100, ". Two shapes work. Pick one, e.g. the table."},
 		"a numbered list is one sentence":    {start + "Which one? 1. Rebase it. 2. Merge it.", 20, 100, ". The report lists every table. Which one? 1. Rebase it. 2. Merge it."},
 		"two that fit to the byte":           {start + "The import ran. I'll check back.", 20, 34, ". The import ran. I'll check back."},
 		"two that are a byte too long":       {start + "The import ran. I'll check back.", 20, 33, " The import ran. I'll check back."},
@@ -84,5 +85,12 @@ func TestSentenceEndsAreMarksBeforeASpace(t *testing.T) {
 	list := "Pick one: 1. Rebase. 2. Merge. 10. Neither... 3. Wait. Then tell me. It was v2. Done."
 	if got := SentenceEnds(list, false); len(got) != 3 || list[got[0][1]:got[1][0]] != "Then tell me" || list[got[2][1]:] != "Done." {
 		t.Errorf("a numbered list: %v", got)
+	}
+	// a number before more than one full stop is no item's number; and every mark and space is one for the pieces
+	if got := SentenceEnds("It ended at step 3... Then it ran.", false); len(got) != 1 {
+		t.Errorf("a number before an ellipsis: %v", got)
+	}
+	if got := SentenceEnds("Pick one: 1. Rebase. 2. Merge.", true); len(got) != 3 {
+		t.Errorf("every mark and space in a list: %v", got)
 	}
 }

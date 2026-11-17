@@ -808,7 +808,11 @@ func TestTranscriptsReadAgainAFileReplacedWithTheSameFirstLine(t *testing.T) {
 func TestTranscriptsMaskAgentTextAtBothCuts(t *testing.T) {
 	home := testHome(t)
 	tok := func(c string) string { return "tok_" + strings.Repeat(c, 30) }
-	text := strings.Repeat("h", headChars-10) + " " + tok("A") + " " + strings.Repeat("m", 3*spare) + " " + tok("B") + strings.Repeat("t", tailChars-12)
+	// token A straddles the head's cut and token B the end's: the end holds no sentence, so it is the last bytes
+	text := strings.Repeat("h", headChars-10) + " " + tok("A") + " " + strings.Repeat("m", 3*spare) + " " + tok("B") + strings.Repeat("t", tailMost-12)
+	if at := len(text) - tailMost - strings.Index(text, "tok_B"); at < 1 || at > 30 {
+		t.Fatalf("setup: token B does not straddle the end's cut: %d bytes of it before the cut", at)
+	}
 	reply, _ := json.Marshal(text)
 	lines := []string{claudeSession()[0], claudeLine(1, `"type":"assistant","uuid":"a1","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":`+string(reply)+`}]}`)}
 	writeLines(t, claudePath(home), lines...)

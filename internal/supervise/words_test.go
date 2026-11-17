@@ -135,10 +135,10 @@ func TestPromiseFindsWorkLeftForLater(t *testing.T) {
 		{"If you approve it, I'll build the checklist page and both of the ads in two languages, as planned.", "I'll build the checklist", ""},
 		// a sentence that fills the kept end to the byte reads the same, and is lost
 		{"I'll report the three row counts as soon as the import of the last table is run.", "I'll report the three", ""},
-		// a kept end that opens with the mark that closed the sentence before: that mark is its first sentence
-		{"I'll report the three row counts as soon as the import of the last table ends.", ". I'll report the three", "I'll report the three row counts as soon as the import of the last table ends."},
-		// a whole sentence after the cut one is read as before, the last and the one before it
-		{"The long export step that started this morning has now finished without any error at all. I'll check back at 14:10.", "his morning has now", "I'll check back at 14:10."},
+		// a promise right after the cut sentence is none: whether the cut one asked cannot be read
+		{"I'll report the three row counts as soon as the import of the last table ends.", ". I'll report the three", ""},
+		{"The long export step that started this morning has now finished without any error at all. I'll check back at 14:10.", "his morning has now", ""},
+		// with two whole sentences after the cut one, the promise among them is read
 		{"The export of every table ran without one error. I'll check back at 14:10. The run is green so far.", "table ran without one error. I'll check", "I'll check back at 14:10."},
 		// a question before the promise is an ask, cut or not
 		{"Was it the staging rule that you meant by the note in the plan? I'll check back on it at 14:10.", "ing rule that you meant", ""},
@@ -240,18 +240,29 @@ func TestWordsKeepWhatTheStoreKeeps(t *testing.T) {
 	if w := Words(two); !strings.HasSuffix(w, "… . The import ran on the staging copy and wrote nothing to the live tables. If you approve it, I'll build the checklist page.") {
 		t.Fatalf("the last two sentences: %q", w)
 	}
-	// up to the bound: two sentences of 478 bytes are kept from their mark, and of 482 are not
-	for pad, whole := range map[int]bool{0: true, 4: false} {
+	// up to the bound: two sentences of 480 bytes are kept from their mark, and of 481 are not
+	for pad, whole := range map[int]bool{2: true, 3: false} {
 		end := "The import " + strings.Repeat("of the next table and ", 18) + strings.Repeat("x", 38+pad) + " ran. I'll check back at 14:10."
 		w := Words(start + end)
 		if got := strings.HasSuffix(w, "… . "+end); got != whole || len(". "+end) != 478+pad {
 			t.Fatalf("an end of %d bytes kept from its mark: %v, want %v: %q", len(". "+end), got, whole, tail(w))
 		}
 	}
-	// when the two do not fit, the last bytes still hold most of the sentence before the last: an ask there is seen
+	// when the two do not fit, the last bytes still hold the end of the sentence before the last: an ask there is
+	// seen; and one whose cue the cut took away is still no promise, since the sentence it stood in is cut
 	ask := start + "The copy can go in two orders, over " + strings.Repeat("the staging tables and ", 14) + "the live ones: let me know which you want copied first and which can wait. I'll keep watching the run on the branch and report back here once its last job is through."
 	if w := Words(ask); !AsksOwner(w) || Promise(w) != "" || !cutInside(w) {
 		t.Fatalf("an ask in a long sentence before a promise: %q", tail(w))
+	}
+	lost := start + "If you want the copy in that order, I can move " + strings.Repeat("the staging tables and ", 16) + "the live ones. I'll keep watching the run on the branch and report back here once its last job is through."
+	if w := Words(lost); AsksOwner(w) || Promise(w) != "" || !cutInside(w) {
+		t.Fatalf("an offer whose cue the cut took: %q", tail(w))
+	}
+	// the store and the words agree on a text that is long only by the space at its end: 240 bytes with a
+	// character across the 160th, which a cut would drop
+	edge := "a" + strings.Repeat("é", 80) + ". The import ran. I'll check back at 14:10 with the counts of " + strings.Repeat("x", 16) + "."
+	if w, kept := Words(edge+"   \n\n  "), source.AgentSummary(edge+"   \n\n  "); len(edge) != headChars+tailChars || w != kept || w != edge {
+		t.Fatalf("space at the end of a text of %d bytes: %q, the store keeps %q", len(edge), w, kept)
 	}
 	// a numbered list after a question is one sentence, not a sentence for each item
 	list := start + "Which do you prefer? 1. **Rebase** - I'll rebase the branch and push it again. 2. **Merge** - I'll merge main into the branch; no force-push is needed, but the history gets a merge commit."

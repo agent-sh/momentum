@@ -44,7 +44,7 @@ var reTrailerEnd = regexp.MustCompile(`</(rollout_ids|citation_entries|oai-mem-c
 // Words is a text as the rules read it: what the store keeps of an agent's text, without what a harness appended
 // to it.
 func Words(s string) string {
-	s = reTrailer.ReplaceAllString(s, " ")
+	s = strings.TrimRightFunc(reTrailer.ReplaceAllString(s, " "), unicode.IsSpace)
 	if len(s) <= headChars+tailChars {
 		return fold(s)
 	}
@@ -189,6 +189,12 @@ func Promise(words string) string {
 	ss := sentences(tail(words))
 	first, left := 0, 2
 	if cutInside(words) {
+		// The kept end's first sentence may lack its start. When it is one of the last two, whether the words end
+		// by asking cannot be read ("Let me know which … . I'll build it after." with the cue cut away): no promise.
+		// An end kept from the mark before its last two sentences has that mark as its first, and both whole.
+		if len(ss) < 3 {
+			return ""
+		}
 		first = 1
 	}
 	for i := len(ss) - 1; i >= first && left > 0; i-- {

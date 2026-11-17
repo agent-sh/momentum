@@ -50,9 +50,11 @@ const (
 // and a space.
 var reSentenceEnd = regexp.MustCompile("[.!?]+[\"'”’)\\]*_`]*\\s+")
 
-// A numbered list is one sentence with what leads to it, or each item would read as a sentence of its own ("Which
-// do you prefer? 1. Rebase. 2. Merge."): the full stop of an item's number ("1.", "12." after a space or at the
-// start) ends nothing, and neither does a mark that an item's number follows.
+// A numbered list of one-sentence items is one sentence with what leads to it, or each item would read as a
+// sentence of its own ("Which do you prefer? 1. Rebase. 2. Merge."): the full stop of an item's number ("1.",
+// "12." after a space or at the start) ends nothing, and neither does a mark that an item's number follows. A
+// sentence of running text that ends in such a number ("I ran test 3. Should I go on?") joins the next the same
+// way.
 var (
 	reListNumber = regexp.MustCompile(`(^|\s)\d{1,3}$`)
 	reListItem   = regexp.MustCompile(`^\d{1,3}\.\s`)
@@ -60,15 +62,16 @@ var (
 
 // SentenceEnds are the places where the sentences of a text end, each as the offset of its mark and the offset
 // where the next sentence begins: at a mark that a space follows. With every false, a mark that a small letter
-// follows ends nothing ("e.g. two columns"), so a sentence that opens with a small letter joins the one before.
-// A mark with no space after it ("v2.1", "config.yaml") never ends one, and a numbered list ends none inside it.
+// follows ends nothing ("e.g. two columns"), so a sentence that opens with a small letter joins the one before,
+// and a numbered list's items join what leads to them. A mark with no space after it ("v2.1", "config.yaml")
+// never ends one.
 func SentenceEnds(text string, every bool) [][2]int {
 	var out [][2]int
 	for _, m := range reSentenceEnd.FindAllStringIndex(text, -1) {
 		if r, _ := utf8.DecodeRuneInString(text[m[1]:]); !every && unicode.IsLower(r) {
 			continue
 		}
-		if text[m[0]] == '.' && text[m[0]+1] != '.' && reListNumber.MatchString(text[max(0, m[0]-4):m[0]]) || reListItem.MatchString(text[m[1]:]) {
+		if !every && (text[m[0]] == '.' && text[m[0]+1] != '.' && reListNumber.MatchString(text[max(0, m[0]-4):m[0]]) || reListItem.MatchString(text[m[1]:])) {
 			continue
 		}
 		out = append(out, [2]int{m[0], m[1]})
@@ -78,8 +81,7 @@ func SentenceEnds(text string, every bool) [][2]int {
 
 // KeptEnd is the end of a long text that a summary keeps. When its last two sentences fit in most bytes, it is
 // those, whole, from the mark that closed the sentence before them: an end that opens with a mark holds whole
-// sentences after it. Else it is the last most bytes, cut at a character: its first sentence was cut, and the rest
-// of that sentence is still most of what it said. It is never shorter than the last least bytes. Space at the
+// sentences after it. Else it is the last most bytes, cut at a character: its first sentence was cut. It is never shorter than the last least bytes. Space at the
 // text's end is no part of it.
 func KeptEnd(text string, least, most int) string {
 	text = strings.TrimRightFunc(text, unicode.IsSpace)
