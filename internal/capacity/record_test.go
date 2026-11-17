@@ -669,8 +669,6 @@ func TestJobsNameWhatTheyRun(t *testing.T) {
 	}
 }
 
-// fillRun is a run that sees dir fill at 45 GiB an hour, with the processes given and the written bytes the look
-// reads (writes, called at the look's start and end).
 // nearLine is a fill configuration whose full line is 10 GiB above the disk's use now: a fill of tens of GiB an hour
 // is due there within the rule's hours, whatever room the machine the test runs on has.
 func nearLine(t *testing.T, dir string) FillConfig { return lineAbove(t, dir, 10) }
@@ -749,9 +747,16 @@ func TestAFillThatCrossesTheLineIsOneFill(t *testing.T) {
 	if d := fillRun(t, st, dir, now, proc(1201), quiet).Disks[0]; !d.Fast {
 		t.Fatalf("setup: the fill is fast below the line: %+v", d)
 	}
-	// five minutes on the disk is past its line (a line set below its use), growing as before
-	cfg := Config{Disks: []string{dir}, Fill: lineAbove(t, dir, -1)}.Normal()
-	o := options(t, proc(1501), now.Add(5*time.Minute), nil)
+	// Half an hour on the disk is past its line (a line set below its use) and gains 2 GiB an hour: over the floor,
+	// and far too slow for its room to be due.
+	var fs syscall.Statfs_t
+	must(t, syscall.Statfs(dir, &fs))
+	used := int64(fs.Blocks-fs.Bfree) * int64(fs.Bsize)
+	size := used + int64(fs.Bavail)*int64(fs.Bsize)
+	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: now.Add(2 * time.Minute)},
+		[]store.DiskSample{{Disk: dir, At: now.Add(2 * time.Minute), Size: size, Used: used - 1<<30, Avail: size - used}}, nil))
+	cfg := Config{Disks: []string{dir}, Fill: FillConfig{Full: 99 * float64(used) / float64(size)}}.Normal()
+	o := options(t, proc(3061), now.Add(31*time.Minute), nil)
 	o.Rules = []string{RuleUV}
 	o.Writes = quiet
 	res, err := Run(ctx, cfg, st, o)
@@ -759,8 +764,11 @@ func TestAFillThatCrossesTheLineIsOneFill(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := res.Disks[0]
-	if d.Rate < 20 {
-		t.Fatalf("setup: the disk still grows fast: %+v", d)
+	if d.pctFull < cfg.Fill.Full || d.Rate < 1 || d.Rate > 5 {
+		t.Fatalf("setup: the disk is past its line and gains about 2 GiB an hour: %+v", d)
+	}
+	if d.FullIn <= 6*time.Hour {
+		t.Skipf("setup: this disk has so little room that it is due by its room alone (%s)", d.FullIn)
 	}
 	if !d.Fast {
 		t.Fatalf("past the line and growing, the open fill goes on: %+v", d)
@@ -773,6 +781,18 @@ func TestAFillThatCrossesTheLineIsOneFill(t *testing.T) {
 	}
 }
 
+// A full percent over 100 is refused: no disk reaches it, so its fill would never be due.
+func TestAFullPercentOver100IsRefused(t *testing.T) {
+	if err := (Config{Fill: FillConfig{Full: 150}}).check(); err == nil || !strings.Contains(err.Error(), "full_pct") {
+		t.Fatalf("full_pct 150: %v", err)
+	}
+	if err := (Config{Fill: FillConfig{Full: 100}}).check(); err != nil {
+		t.Fatalf("full_pct 100: %v", err)
+	}
+}
+
+// fillRun is a run that sees dir fill fast (15 GiB in the fixture's 24 minutes, with its line 10 GiB away), with the
+// processes given and the written bytes the look reads (writes, called at the look's start and end).
 func fillRun(t *testing.T, st *store.Store, dir string, now time.Time, proc string, writes func() map[int]int64) *Result {
 	t.Helper()
 	cfg := Config{Disks: []string{dir}, Fill: nearLine(t, dir)}.Normal()

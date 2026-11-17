@@ -715,6 +715,9 @@ func writersOf(runs []fastRun) []Writer {
 	}
 	by := map[key]Writer{}
 	add := func(w Writer) { // each run's writes are its own stretch: they add up; the newest run names it
+		if w.Span == 0 {
+			w.Span = w.Over // a run recorded before the time between the runs was: its own stretch is all there is
+		}
 		k := key{w.PID, w.Start}
 		if o, ok := by[k]; ok {
 			o.Written, o.Over, o.Span, o.Rate = o.Written+w.Written, o.Over+w.Over, o.Span+w.Span, max(o.Rate, w.Rate)

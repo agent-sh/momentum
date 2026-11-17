@@ -68,10 +68,15 @@ func (r *runner) disk(ctx context.Context, disks []DiskState) bool {
 		// A rate alone is no fill: on a disk with room, a build's churn writes fast and reaches nothing.
 		due := d.FullIn > 0 && d.FullIn <= time.Duration(r.cfg.Fill.WithinHours*float64(time.Hour))
 		if past && !due && d.Rate >= r.cfg.Fill.MinGiBPerHour && r.st != nil {
-			// a fill that crossed its line goes on while the disk grows: one fill, not one that ended at the line
-			// and another when the room runs short
+			// A fill that is open goes on past the line while the disk gains the floor rate or more, and ends at the
+			// first run that sees less: one fill, not one that ended at the line and another when the room runs short.
 			open, err := r.st.Mark(ctx, "fill-open:"+d.Disk)
-			due = err == nil && !open.IsZero()
+			if err != nil { // not known: the disk is left as it is, as when its samples cannot be read
+				d.Err = err.Error()
+				r.res.Disks = append(r.res.Disks, *d)
+				continue
+			}
+			due = !open.IsZero()
 		}
 		d.Fast = d.Rate >= r.cfg.Fill.MinGiBPerHour && due
 		if d.Fast {
