@@ -422,9 +422,11 @@ func TestADiskWhosePathHoldsASpaceHasItsNotes(t *testing.T) {
 	var fs syscall.Statfs_t
 	must(t, syscall.Statfs(dir, &fs))
 	used := int64(fs.Blocks-fs.Bfree) * int64(fs.Bsize)
-	// 24 minutes ago the disk held 15 GiB less: it fills fast, and it is past a full percent this low
+	// it is past a full percent this low, and 24 minutes ago it held a tenth of its room less: at that rate the room
+	// is gone in four hours, so it fills fast
+	grew := int64(fs.Bavail)*int64(fs.Bsize)/10 + 15<<30
 	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: now.Add(-24 * time.Minute)},
-		[]store.DiskSample{{Disk: dir, At: now.Add(-24 * time.Minute), Size: 1 << 40, Used: used - 15<<30, Avail: 1 << 39}}, nil))
+		[]store.DiskSample{{Disk: dir, At: now.Add(-24 * time.Minute), Size: 1 << 40, Used: used - grew, Avail: 1 << 39}}, nil))
 	cfg := Config{Disks: []string{dir}, Fill: FillConfig{Full: 0.001}}.Normal()
 	o := options(t, procRoot(t), now, nil)
 	o.Rules = []string{RuleUV}

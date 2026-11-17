@@ -14,8 +14,9 @@ import (
 )
 
 // The disk rule. Every run records each disk's use, and each process's written bytes (a snapshot the next run
-// compares with). When a disk fills faster than the threshold over the window, or would reach the full percent
-// within the configured hours at that rate, the run names the processes that write: fast at a look of a few
+// compares with). When a disk would reach the full percent within the configured hours at its rate over the
+// window (or, already past it, would run out of room within them), the run names the processes that write: fast
+// at a look of a few
 // seconds, or since the run before. It names each one's working directory and the agent session it runs under, and
 // leaves a problem note: never a notification. Every judging rule then scans on that run, whatever its cadence. A
 // disk above its full percent has its own note.
@@ -51,13 +52,17 @@ func (r *runner) disk(ctx context.Context, disks []DiskState) bool {
 				break
 			}
 		}
+		// what is left to the full percent, or, for a disk already past it (which has a note of its own, recordFull),
+		// the room it still has
 		left := r.cfg.Fill.Full/100*float64(d.Used+d.Avail) - float64(d.Used)
+		if left <= 0 {
+			left = float64(d.Avail)
+		}
 		if d.Rate > 0 && left > 0 {
 			d.FullIn = time.Duration(left / (1 << 30) / d.Rate * float64(time.Hour))
 		}
-		// A disk already above its full percent is full, not filling fast: it has a note of its own (recordFull).
-		d.Fast = d.Rate >= r.cfg.Fill.GiBPerHour ||
-			(d.Rate >= r.cfg.Fill.MinGiBPerHour && d.FullIn > 0 && d.FullIn <= time.Duration(r.cfg.Fill.WithinHours*float64(time.Hour)))
+		// A rate alone is no fill: on a disk with room, a build's churn writes fast and reaches nothing.
+		d.Fast = d.Rate >= r.cfg.Fill.MinGiBPerHour && d.FullIn > 0 && d.FullIn <= time.Duration(r.cfg.Fill.WithinHours*float64(time.Hour))
 		if d.Fast {
 			fast = true
 			d.Writers = r.writers(ctx, d.mountPath)
@@ -85,7 +90,9 @@ func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 		r.iv = between(r.prevWrites, r.writes)
 	}
 	iv := r.iv
-	// a writer since the run before counts from the slowest fill the rule reports, which a writer alone may make
+	// a writer since the run before counts from the slowest fill the rule reports, which a writer alone may make:
+	// by what it wrote over the time between the two runs, so a process that lived a moment is not one for its
+	// rate over that moment
 	slowest := r.cfg.Fill.MinGiBPerHour * 1024 / 3600
 	pids := map[int]bool{}
 	for pid := range b {
@@ -102,10 +109,11 @@ func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 				w.Rate = float64(n-before) / (1 << 20) / secs
 			}
 		}
+		span := 0.0
 		if d, ok := iv[pid]; ok {
-			w.Written, w.Over = d.written, d.over
+			w.Written, w.Over, span = d.written, d.over, d.span
 		}
-		if w.Rate < 1 && (w.Over <= 0 || w.since() < slowest) {
+		if w.Rate < 1 && (span <= 0 || float64(w.Written)/(1<<20)/span < slowest) {
 			continue
 		}
 		if p, ok := r.sample.Table[pid]; ok { // the sample's names, for a process that ended since
@@ -208,10 +216,12 @@ func bootID(procRoot string) string {
 	return strings.TrimSpace(string(b))
 }
 
-// wrote is what a process wrote between two snapshots, and over how many seconds.
+// wrote is what a process wrote between two snapshots, over how many seconds (its own life, for one that started
+// since), and the seconds between the two snapshots where they are of one boot.
 type wrote struct {
 	written int64
 	over    float64
+	span    float64
 }
 
 // between is what each process wrote since the snapshot before. The same process (pid and start, on the same boot)
@@ -244,9 +254,15 @@ func between(prev, cur writesSnap) map[int]wrote {
 			if w.Written < p.Written {
 				continue
 			}
-			out[pid] = wrote{max(0, w.Written-p.Written-took[pid]), float64(cur.snap.Uptime-prev.snap.Uptime) / userHZ}
+			over := float64(cur.snap.Uptime-prev.snap.Uptime) / userHZ
+			out[pid] = wrote{max(0, w.Written-p.Written-took[pid]), over, over}
 		case !sameBoot || w.Start >= prev.snap.Uptime: // a start in the tick of the look before is after it
-			out[pid] = wrote{w.Written, float64(max(0, cur.snap.Uptime-w.Start)) / userHZ}
+			over := float64(max(0, cur.snap.Uptime-w.Start)) / userHZ
+			span := over // another boot: all that is known is its own life
+			if sameBoot {
+				span = float64(cur.snap.Uptime-prev.snap.Uptime) / userHZ
+			}
+			out[pid] = wrote{w.Written, over, span}
 		}
 	}
 	return out

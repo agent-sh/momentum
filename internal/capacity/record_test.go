@@ -588,7 +588,7 @@ func TestAFastFillNamesItsWritersInANoteOncePerFill(t *testing.T) {
 	// 20 minutes ago the disk held 15 GiB less: 45 GiB an hour
 	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: now.Add(-20 * time.Minute)},
 		[]store.DiskSample{{Disk: dir, At: now.Add(-20 * time.Minute), Size: 1 << 40, Used: used - 15<<30, Avail: 1 << 39}}, nil))
-	cfg := Config{Disks: []string{dir}}.Normal()
+	cfg := Config{Disks: []string{dir}, Fill: nearLine(t, dir)}.Normal()
 	proc := procRoot(t, fakeProc{pid: 21, ppid: 20, argv: []string{"cp"}, cwd: dir}, fakeProc{pid: 20, ppid: 1, argv: []string{"claude"}})
 	calls := 0
 	o := options(t, proc, now, nil)
@@ -671,9 +671,65 @@ func TestJobsNameWhatTheyRun(t *testing.T) {
 
 // fillRun is a run that sees dir fill at 45 GiB an hour, with the processes given and the written bytes the look
 // reads (writes, called at the look's start and end).
+// nearLine is a fill configuration whose full line is 10 GiB above the disk's use now: a fill of tens of GiB an hour
+// is due there within the rule's hours, whatever room the machine the test runs on has.
+func nearLine(t *testing.T, dir string) FillConfig { return lineAbove(t, dir, 10) }
+
+// lineAbove is a fill configuration whose full line is gib GiB above the disk's use now.
+func lineAbove(t *testing.T, dir string, gib float64) FillConfig {
+	t.Helper()
+	var fs syscall.Statfs_t
+	must(t, syscall.Statfs(dir, &fs))
+	used := float64(fs.Blocks-fs.Bfree) * float64(fs.Bsize)
+	return FillConfig{Full: 100 * (used + gib*(1<<30)) / (used + float64(fs.Bavail)*float64(fs.Bsize))}
+}
+
+// A fast rate alone is no fill. The disk gained 15 GiB in 24 minutes, and its full line is 400 GiB away: at that
+// rate it is due in over ten hours, past the rule's six. A build's churn writes that fast and reaches nothing.
+func TestAFastRateOnADiskWithRoomIsNoFill(t *testing.T) {
+	ctx := context.Background()
+	st, dir, now, proc := fillFixture(t)
+	cfg := Config{Disks: []string{dir}, Fill: lineAbove(t, dir, 400)}.Normal()
+	o := options(t, proc(1201), now, nil)
+	o.Rules = []string{RuleUV}
+	o.Writes = quiet
+	res, err := Run(ctx, cfg, st, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := res.Disks[0]
+	if d.Rate < 30 || d.FullIn <= 6*time.Hour {
+		t.Fatalf("setup: the disk gains %v GiB an hour and its line is due in %s", d.Rate, d.FullIn)
+	}
+	if d.Fast {
+		t.Fatalf("%.0f GiB an hour with the line %s away is no fast fill: %+v", d.Rate, d.FullIn, d)
+	}
+	if n, ok, _ := st.Note(ctx, "capacity:fill:"+dir); ok {
+		t.Fatalf("no fill, and a note: %+v", n)
+	}
+}
+
+// A writer since the run before counts by what it wrote over the time between the two runs. A process that lived a
+// moment and wrote little is none, whatever its rate over that moment; one that wrote much in a short life is.
+func TestAWriterCountsByWhatItWroteBetweenTheRuns(t *testing.T) {
+	st, dir, now, proc := fillFixture(t)
+	idle := fakeProc{pid: 40, ppid: 1, argv: []string{"bash"}, cwd: dir}
+	fillRun(t, st, dir, now.Add(-5*time.Minute), proc(1201, idle), quiet)
+	blip := fakeProc{pid: 41, ppid: 1, argv: []string{"tool"}, cwd: dir, written: 200 << 10, start: 150097} // 0.03 s old: 6 MiB/s over its life
+	burst := fakeProc{pid: 42, ppid: 1, argv: []string{"cp"}, cwd: dir, written: 2 << 30, start: 149900}    // 2 s old
+	d := fillRun(t, st, dir, now, proc(1501, idle, blip, burst), quiet).Disks[0]
+	got := map[int]bool{}
+	for _, w := range d.Writers {
+		got[w.PID] = true
+	}
+	if !d.Fast || got[41] || !got[42] {
+		t.Fatalf("200 KiB in the 5 minutes between the runs names no writer, and 2 GiB does: fast %v, writers %+v", d.Fast, d.Writers)
+	}
+}
+
 func fillRun(t *testing.T, st *store.Store, dir string, now time.Time, proc string, writes func() map[int]int64) *Result {
 	t.Helper()
-	cfg := Config{Disks: []string{dir}}.Normal()
+	cfg := Config{Disks: []string{dir}, Fill: nearLine(t, dir)}.Normal()
 	o := options(t, proc, now, nil)
 	o.Rules = []string{RuleUV}
 	o.Writes = writes
@@ -993,21 +1049,21 @@ func TestBetweenTwoSnapshots(t *testing.T) {
 	if _, ok := got[1]; ok {
 		t.Errorf("a counter that went down is not known: %+v", got)
 	}
-	if got[2] != (wrote{50, 300}) {
+	if got[2] != (wrote{50, 300, 300}) {
 		t.Errorf("the same process wrote the difference: %+v", got)
 	}
 	got = between(prev, snap(2000, "b2", store.ProcWrite{PID: 1, Start: 10, Written: 400}))
-	if got[1] != (wrote{400, 19.9}) {
+	if got[1] != (wrote{400, 19.9, 19.9}) {
 		t.Errorf("on another boot every process started since: %+v", got)
 	}
 	// a process that started in the very tick the look before read the clock is after it
 	got = between(snap(1000, "b1"), snap(31000, "b1", store.ProcWrite{PID: 5, Start: 1000, Written: 7}))
-	if got[5] != (wrote{7, 300}) {
+	if got[5] != (wrote{7, 300, 300}) {
 		t.Errorf("a start in the tick of the look before counts as since: %+v", got)
 	}
 	// without boot ids, an uptime that went down is another boot
 	got = between(snap(5000, "", store.ProcWrite{PID: 1, Start: 10, Written: 500}), snap(100, "", store.ProcWrite{PID: 1, Start: 10, Written: 600}))
-	if got[1] != (wrote{600, 0.9}) {
+	if got[1] != (wrote{600, 0.9, 0.9}) {
 		t.Errorf("an uptime that went down is another boot: %+v", got)
 	}
 	const g = 1 << 30

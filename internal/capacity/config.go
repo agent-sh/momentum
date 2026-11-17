@@ -133,10 +133,11 @@ type DockerConfig struct {
 	EveryHours float64 `json:"every_hours"`
 }
 
-// FillConfig is when a disk fills fast: more than GiBPerHour over the last Window, or Full percent due within
-// WithinHours at that rate when it is at least MinGiBPerHour (a creep that slow is the full note's, at the line).
+// FillConfig is when a disk fills fast: Full percent due within WithinHours at its rate over the last Window, or
+// for a disk past that percent no room left within them, when the rate is at least MinGiBPerHour (a creep that
+// slow is the full note's, at the line). A rate alone is no fill: a build's churn on a disk with room writes fast
+// and reaches nothing.
 type FillConfig struct {
-	GiBPerHour    float64 `json:"gib_per_hour"`
 	MinGiBPerHour float64 `json:"min_gib_per_hour"`
 	Full          float64 `json:"full_pct"`
 	WithinHours   float64 `json:"within_hours"`
@@ -209,7 +210,7 @@ const (
 	defaultUVMaxGiB    = 30
 	defaultUVEveryDays = 7
 	defaultDockerUntil = "168h"
-	defaultFillGiBHour = 20
+	defaultFillMinRate = 1
 	defaultFillFull    = 94
 	defaultFillWithin  = 6
 	defaultFillWindow  = 30
@@ -244,8 +245,7 @@ func (c Config) Normal() Config {
 	set(&c.UV.EveryDays, defaultUVEveryDays)
 	set(&c.UV.EveryHours, defaultScanHours)
 	set(&c.Docker.EveryHours, defaultDockerHours)
-	set(&c.Fill.GiBPerHour, defaultFillGiBHour)
-	set(&c.Fill.MinGiBPerHour, c.Fill.GiBPerHour/20)
+	set(&c.Fill.MinGiBPerHour, defaultFillMinRate)
 	set(&c.Fill.Full, defaultFillFull)
 	set(&c.Fill.WithinHours, defaultFillWithin)
 	set(&c.Fill.WindowMin, defaultFillWindow)
