@@ -34,6 +34,7 @@ type lifeWorld struct {
 	st      *store.Store
 	f, g    repoFixture
 	other   string // agent-sh/other's checkout
+	landed  bool   // a landing of the walk's reached the default branch
 	home    string
 	s       *Ship
 	r       *Runner
@@ -459,10 +460,8 @@ func (w *lifeWorld) event(name string) error {
 		}
 		w.s.Live = true
 		defer func() { w.s.Live = false }()
-		_, err := w.s.Land(ctx, id)
-		if err != nil && strings.Contains(err.Error(), "could not be read") {
-			t.Fatalf("the walk's forge answered the landing's read of the checks with nothing: %v", err)
-		}
+		got, err := w.s.Land(ctx, id)
+		w.landed = w.landed || err == nil && got.State == Landed
 		return err
 	case "the owner withdraws the package":
 		_, err := w.s.Withdraw(ctx, id, "its fix moved")
@@ -740,6 +739,7 @@ var lifeStarts = map[string][]string{
 	"repo proposed with a PR": {"owner prepare", "check", "propose"},
 	"config proposed":         {"new episode, a configuration file", "pass prepare", "check", "propose"},
 	"config filed":            {"new episode, a configuration file", "pass prepare", "check", "propose", "review clean"},
+	"repo reviewed clean":     {"owner prepare", "check", "propose", "review clean"},
 }
 
 // The lifecycle of a case's packages keeps its invariants after every step (lifeWorld.invariants): a package that has
@@ -762,6 +762,7 @@ func TestAPackagesLifecycleKeepsItsInvariants(t *testing.T) {
 		"repo proposed with a PR": func(p Package) bool { return p.Kind == KindRepo && p.State == Proposed && p.PR != "" },
 		"config proposed":         func(p Package) bool { return p.Kind == KindConfig && p.State == Proposed && p.Filed.IsZero() },
 		"config filed":            func(p Package) bool { return p.Kind == KindConfig && p.State == Proposed && !p.Filed.IsZero() },
+		"repo reviewed clean":     func(p Package) bool { return p.Kind == KindRepo && p.State == Proposed && p.PR != "" && p.Clean() },
 	}
 	begin := func(t *testing.T, start string) *lifeWorld {
 		w := newLifeWorld(t)
@@ -773,6 +774,16 @@ func TestAPackagesLifecycleKeepsItsInvariants(t *testing.T) {
 		}
 		return w
 	}
+	// the walk's landing is a real one: from a clean review it lands
+	t.Run("a clean review lands", func(t *testing.T) {
+		t.Parallel()
+		w := begin(t, "repo reviewed clean")
+		w.step("a landing", 0)
+		if !w.landed {
+			p, _ := w.load()
+			t.Fatalf("a proposal reviewed clean did not land: %s (steps %q)", p.State, w.steps)
+		}
+	})
 	for _, start := range starts {
 		for _, e := range lifeEvents {
 			t.Run(start+"/"+e, func(t *testing.T) {

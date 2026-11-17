@@ -1414,7 +1414,8 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 			}
 			if relationErr == nil {
 				// the head that reaches the base passes the repository's CI first, as in a landing that was not cut
-				if _, err := s.landingCI(ctx, &p, caseID, p.LandingHead); err != nil {
+				// (read once: the landing that journaled this head has waited for it already)
+				if _, err := s.landingCI(ctx, &p, caseID, p.LandingHead, false); err != nil {
 					return p, err
 				}
 				if err := s.openPR(ctx, p); err != nil {
@@ -1468,7 +1469,14 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
 	}
-	if _, err := s.ciPassed(ctx, p, p.Head, false); err != nil {
+	// the request first: a closed one is settled whatever its CI says, and a red one is what a person closes
+	if err := s.openPR(ctx, p); err != nil {
+		if errors.Is(err, errPRClosed) {
+			return s.closedProposal(ctx, p)
+		}
+		return p, err
+	}
+	if _, err := s.ciPassed(ctx, p, p.Head, 0); err != nil {
 		return p, err
 	}
 	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
@@ -1543,7 +1551,7 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	// A rebase made a commit the repository's CI has not read. It is on the proposal branch now, where the CI
 	// runs; the base waits for it. A wait that runs out keeps the journaled head, and the next landing resumes
 	// from it. A head the rebase left as it was is read once more: its checks may have been run again since.
-	if closed, err := s.landingCI(ctx, &p, caseID, head); err != nil {
+	if closed, err := s.landingCI(ctx, &p, caseID, head, true); err != nil {
 		complete = closed // a closed proposal's package is already put back
 		return p, err
 	}
@@ -1572,16 +1580,18 @@ type ciWaits struct{ error }
 func (e ciWaits) Unwrap() error { return e.error }
 
 // ciPassed refuses a landing unless the repository's own CI has passed on a commit: every check suite of GitHub
-// Actions there (one for each workflow run, and for code scanning's when the repository has it on) is complete and
-// passed. It reports whether the commit has one. A suite, not its check runs: a job that waits on another has no
-// check run until it is queued, and a suite is complete only when its last job is. Another app's suite (an advisory
-// bot, or an app that opens one and reports nothing) is not waited for. must says the commit has to have a suite:
-// the loop's own repository has CI, and so does one whose reviewed head had a suite, which is how the head a rebase
-// made is told from a repository without CI in its first seconds, when it lists nothing.
-func (s *Ship) ciPassed(ctx context.Context, p Package, sha string, must bool) (bool, error) {
+// Actions there (one for each workflow run, the code scanning analysis among them where the repository has it on)
+// is complete and passed. It returns how many the commit has. A suite, not its check runs: a job that waits on
+// another has no check run until it is queued, and a suite is complete only when its last job is. Another app's
+// suite (an advisory bot, or an app that opens one and reports nothing) is not waited for. need is how many suites
+// the commit must list: a new commit lists none for its first seconds and then one after another, so the head a
+// rebase made must list as many as the reviewed head did. The loop's own repository has CI, so there a commit
+// with none waits whatever need says. A suite an earlier run of a workflow left failed or cancelled refuses until
+// that run is run again.
+func (s *Ship) ciPassed(ctx context.Context, p Package, sha string, need int) (int, error) {
 	raw, err := s.gh(ctx, p.Host, "api", "repos/"+p.Repo+"/commits/"+sha+"/check-suites?per_page=100")
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	var list struct {
 		Total  int `json:"total_count"`
@@ -1591,10 +1601,10 @@ func (s *Ship) ciPassed(ctx context.Context, p Package, sha string, must bool) (
 		} `json:"check_suites"`
 	}
 	if err := json.Unmarshal([]byte(raw), &list); err != nil {
-		return false, refused("case %s's checks could not be read: no landing", p.Case)
+		return 0, refused("case %s's checks could not be read: no landing", p.Case)
 	}
 	if list.Total > len(list.Suites) {
-		return false, refused("case %s's commit has more check suites than one read holds (%d): no landing", p.Case, list.Total)
+		return 0, refused("case %s's commit has more check suites than one read holds (%d): no landing", p.Case, list.Total)
 	}
 	own, running := 0, false
 	for _, r := range list.Suites {
@@ -1606,16 +1616,19 @@ func (s *Ship) ciPassed(ctx context.Context, p Package, sha string, must bool) (
 		case r.Status != "completed":
 			running = true
 		case !ciOK[r.Conclusion]:
-			return true, refused("case %s's CI did not pass on %s (%s): no landing", p.Case, sha, plain.Line(r.Conclusion))
+			return own, refused("case %s's CI did not pass on %s (%s): no landing", p.Case, sha, plain.Line(r.Conclusion))
 		}
+	}
+	if strings.EqualFold(p.Repo, SelfRepo) {
+		need = max(need, 1)
 	}
 	switch {
 	case running:
-		return true, ciWaits{refused("case %s's CI has not finished on %s: no landing yet", p.Case, sha)}
-	case own == 0 && (must || strings.EqualFold(p.Repo, SelfRepo)):
-		return false, ciWaits{refused("case %s's CI has not reported on %s: no landing yet", p.Case, sha)}
+		return own, ciWaits{refused("case %s's CI has not finished on %s: no landing yet", p.Case, sha)}
+	case own < need:
+		return own, ciWaits{refused("case %s's CI has not reported on %s (%d of %d workflows): no landing yet", p.Case, sha, own, need)}
 	}
-	return own > 0, nil
+	return own, nil
 }
 
 // A landing waits ciWait for the CI of the head it is about to push, reading every ciPoll: several times what a CI
@@ -1625,16 +1638,13 @@ const (
 	ciPoll = 15 * time.Second
 )
 
-// landingCI holds the push of a landing's head to the base until the repository's CI has passed on it. The reviewed
-// head says whether the repository has CI. While the head's workflows run, or have not reported, it reads again,
-// for ciWait at most, and then returns the refusal. A pull request closed meanwhile gets no run, so it is read
-// first: a closed one ends the landing as it does at the push (closedProposal), which closed reports. After a wait
-// the case is read again: it may have left testing.
-func (s *Ship) landingCI(ctx context.Context, p *Package, caseID, head string) (closed bool, err error) {
-	must, err := s.ciPassed(ctx, *p, p.Head, false)
-	if err != nil {
-		return false, err
-	}
+// landingCI holds the push of a landing's head to the base until the repository's CI has passed on it. The pull
+// request is read first: a closed one gets no run, and ends the landing as it does at the push (closedProposal),
+// which closed reports. The reviewed head says how many workflows the repository runs. While the head's workflows
+// run, or have not all reported, a landing that waits reads again, for ciWait at most, and then returns the
+// refusal; a resumed one reads once, since the landing that journaled its head has waited. After a wait the case is
+// read again: it may have left testing.
+func (s *Ship) landingCI(ctx context.Context, p *Package, caseID, head string, waits bool) (closed bool, err error) {
 	if err := s.openPR(ctx, *p); err != nil {
 		if errors.Is(err, errPRClosed) {
 			*p, err = s.closedProposal(ctx, *p)
@@ -1642,10 +1652,14 @@ func (s *Ship) landingCI(ctx context.Context, p *Package, caseID, head string) (
 		}
 		return false, err
 	}
+	need, err := s.ciPassed(ctx, *p, p.Head, 0)
+	if err != nil {
+		return false, err
+	}
 	end, waited := s.now().Add(ciWait), false
 	for {
-		_, err := s.ciPassed(ctx, *p, head, must)
-		if w := (ciWaits{}); !errors.As(err, &w) || !s.now().Before(end) {
+		_, err := s.ciPassed(ctx, *p, head, need)
+		if w := (ciWaits{}); !waits || !errors.As(err, &w) || !s.now().Before(end) {
 			if err == nil && waited {
 				_, err = s.working(ctx, caseID)
 			}
