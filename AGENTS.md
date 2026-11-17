@@ -16,4 +16,7 @@ SPEC.md describes the design. Keep it roughly in step with the code when a chang
 
 ## Tests
 
-Run the loop package with `go test -timeout 50m ./internal/loop`. Its sandbox checks can exceed Go's default timeout. Use `-run` for focused checks.
+- Run every `go test` and `go build` under a memory cap, after a look at free memory (`free -g`): `systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=1G -- go test ...`. A run that outgrows the cap is killed alone, and the machine's other work goes on.
+- Run the loop package with `systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=1G -- go test -count=1 -timeout 50m ./internal/loop`. Its sandbox checks can exceed Go's default timeout. Use `-run` for focused checks.
+- Go's test log is what grows: without `-count=1` the go command logs every file the tests stat or open, then reads that log whole and hashes what it names. The loop package turns the log off in its `TestMain` and fails a run whose log passes a bound (`testLogMax`), so its runs are never cached. In another package, do not walk a large tree through `os.Stat` or `os.Open` in a test, or in code a test runs: the sandbox checks its bind sources with the system calls for that reason.
+- The loop's own runs need no prefix: each agent, check and review runs inside the sandbox unit, which has a memory limit and no swap.

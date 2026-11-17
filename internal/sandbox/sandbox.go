@@ -566,21 +566,56 @@ func source(path string) error {
 	if !st.IsDir() {
 		return nil
 	}
-	return filepath.WalkDir(path, func(name string, _ fs.DirEntry, err error) error {
-		if err != nil {
-			return fmt.Errorf("sandbox: walk source: %w", err)
+	return noSocket(path)
+}
+
+// noSocket refuses a source directory that holds a socket anywhere under it. It lstats each entry, mount points
+// included: a directory entry's type alone can describe the covered inode of a socket mount instead of its source.
+//
+// It reads the tree with the system calls themselves, not through os.Open and os.Lstat. A source may be a toolchain
+// or a module cache of a million files, and every launch walks it. Go's test runner records each file a test stats
+// or opens through package os in a log, which the go command reads whole and hashes after the run: a suite that
+// launched the sandbox a few hundred times filled that log with tens of millions of lines, and the go command with
+// tens of GB of memory. A directory is opened without following a link, so one replaced by a link after its lstat
+// is refused.
+func noSocket(dir string) error {
+	names, err := dirNames(dir)
+	if err != nil {
+		return fmt.Errorf("sandbox: walk source: %w", err)
+	}
+	for _, name := range names {
+		p := filepath.Join(dir, name)
+		var st syscall.Stat_t
+		if err := syscall.Lstat(p, &st); err != nil {
+			return fmt.Errorf("sandbox: inspect source: %w", &fs.PathError{Op: "lstat", Path: p, Err: err})
 		}
-		// Lstat each entry, including mount points. DirEntry.Type alone can
-		// describe the covered inode of a socket mount instead of its source.
-		info, err := os.Lstat(name)
-		if err != nil {
-			return fmt.Errorf("sandbox: inspect source: %w", err)
-		}
-		if info.Mode()&os.ModeSocket != 0 {
+		switch st.Mode & syscall.S_IFMT {
+		case syscall.S_IFSOCK:
 			return errors.New("sandbox: source directory holds a socket")
+		case syscall.S_IFDIR:
+			if err := noSocket(p); err != nil {
+				return err
+			}
 		}
-		return nil
-	})
+	}
+	return nil
+}
+
+// dirNames are a directory's entries, read from a descriptor opened by the system call (noSocket).
+func dirNames(dir string) ([]string, error) {
+	for {
+		fd, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return nil, &fs.PathError{Op: "open", Path: dir, Err: err}
+		}
+		f := os.NewFile(uintptr(fd), dir)
+		names, err := f.Readdirnames(-1)
+		f.Close()
+		return names, err
+	}
 }
 
 func (s Spec) identity() (func(), error) {
