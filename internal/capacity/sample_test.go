@@ -41,10 +41,16 @@ func TestTheSamplerSeesOpenMappedAndWorkingPathsAndRepoIDs(t *testing.T) {
 			cwd: data + "/runs/r1", exe: "/usr/bin/vllm", fds: []string{data + "/models/b/w.bin", "socket:[1]", "/etc/hosts"},
 			maps: []string{data + "/models/c/w.safetensors", data + "/models/c/w.safetensors", "/usr/lib/libc.so.6", data + "/models/d (deleted)"}},
 		fakeProc{pid: 11, ppid: 10, argv: []string{"bash"}, cwd: "/home"},
+		// a program that only sizes, lists or names the paths it is given does not use them; its working directory
+		// still counts, and a find that deletes does more than look
+		fakeProc{pid: 12, ppid: 10, argv: []string{"/usr/bin/du", "-sh", data + "/models/e", data + "/scratch/s1"}, cwd: data + "/runs/r2"},
+		fakeProc{pid: 13, ppid: 10, argv: []string{"ls", "-la", data + "/scratch/s2"}, cwd: "/home"},
+		fakeProc{pid: 14, ppid: 10, argv: []string{"find", data + "/scratch/s3", "-name", "*.tmp", "-delete"}, cwd: "/home"},
+		fakeProc{pid: 15, ppid: 10, argv: []string{"find", data + "/scratch/s4", "-name", "*.tmp"}, cwd: "/home"},
 	)
 	s := TakeSample(proc, nil, func(p string) bool { return strings.HasPrefix(p, data+"/") })
-	if s.Procs != 3 { // and the test's own
-		t.Fatalf("read %d processes, want 3", s.Procs)
+	if s.Procs != 7 { // and the test's own
+		t.Fatalf("read %d processes, want 7", s.Procs)
 	}
 	got := map[string]string{}
 	for _, u := range s.Uses {
@@ -56,6 +62,8 @@ func TestTheSamplerSeesOpenMappedAndWorkingPathsAndRepoIDs(t *testing.T) {
 		data + "/models/b/w.bin":         "fd",
 		data + "/models/c/w.safetensors": "map",
 		data + "/models/d":               "map", // a deleted file it still maps
+		data + "/runs/r2":                "cwd", // du's working directory
+		data + "/scratch/s3":             "arg", // a find that deletes
 	}
 	for p, how := range want {
 		if got[p] != how {

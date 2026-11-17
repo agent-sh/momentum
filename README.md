@@ -144,7 +144,7 @@ A request holds the same turns, links and state whether a list, its id or one of
 momentum capacity [--dry-run] [--now] [--rule R,R] [--json] [--all]
 ```
 
-It keeps the disks from filling. Each run samples which paths processes use (open files, memory maps, working directories, programs, command lines, Docker containers' bind mounts), since a noatime mount records no read, and records each disk's use. Then each rule that is due scans:
+It keeps the disks from filling. Each run samples which paths processes use (open files, memory maps, working directories, programs, command lines, Docker containers' bind mounts), since a noatime mount records no read, and records each disk's use. A path on the command line of a program that only sizes, lists or names it (`du`, `ls`, `stat`, a `find` with no action) is no use of it. Then each rule that is due scans:
 
 - **models:** a top-level item of a models, datasets or model-cache root with no write and no use seen for 30 days of watching. A root's items wait until the sampler has watched it for 30 days, and time it did not run does not count. A Hugging Face cache's shared Xet blobs go with the last repository that links them, under Hugging Face's own locks.
 - **targets:** a Cargo target directory with no write for 48 hours, that no process uses, that git does not track, and whose project is known and not excluded. What Cargo does not build again (saved benchmark baselines) stays.

@@ -149,11 +149,14 @@ func TakeSample(procRoot string, m *Mounts, keep func(string) bool) *Sample {
 			}
 		}
 		readMaps(filepath.Join(dir, "maps"), func(p string) { add(p, "map", pid, comm) })
+		looks := measuring(argv) // a path it only sizes, lists or names is not in use by it
 		for _, a := range argv[1:] {
 			for _, w := range words(a) {
 				switch {
 				case filepath.IsAbs(w):
-					add(w, "arg", pid, comm)
+					if !looks {
+						add(w, "arg", pid, comm)
+					}
 				case isRepoID(w):
 					if _, ok := s.RepoIDs[w]; !ok {
 						s.RepoIDs[w] = Use{Path: w, How: "arg", PID: pid, Comm: comm}
@@ -164,6 +167,22 @@ func TakeSample(procRoot string, m *Mounts, keep func(string) bool) *Sample {
 	}
 	s.Took = time.Since(start)
 	return s
+}
+
+// measures are programs that look at a path without using what it holds: they size it, list it or name it.
+var measures = map[string]bool{"du": true, "ls": true, "eza": true, "exa": true, "stat": true, "tree": true, "df": true,
+	"find": true, "fd": true, "readlink": true, "realpath": true, "basename": true, "dirname": true, "test": true, "[": true}
+
+// measuring reports a process that only looks at the paths on its command line (measures), so they are no use of
+// them: a du over a whole cache names every folder in it, and counted as a use it started each one's idle time
+// again. A find that deletes or runs a program does more than look. Its working directory and its open files
+// still count.
+func measuring(argv []string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+	prog := filepath.Base(argv[0])
+	return measures[prog] && readOnly(prog, argv[1:])
 }
 
 // parentOf is the parent pid in a stat line. The command name in parentheses may hold spaces and parentheses, so
