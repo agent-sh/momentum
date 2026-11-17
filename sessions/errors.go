@@ -16,10 +16,13 @@ const (
 var (
 	// Never tried again: a refusal, a request too long to send, a misuse.
 	reNoRetry = regexp.MustCompile(`(?i)safeguards flagged|safety classifier|usage policy|prompt is too long|too long for|context (window|length) (exceeded|is full)|invalid[_ ]request|credit balance|capture only|tool use concurrency`)
-	reOrg     = regexp.MustCompile(`(?i)organization has disabled|disabled (claude )?subscription access|ask your admin to enable`)
-	reLogin   = regexp.MustCompile(`(?i)login expired|not logged in|please run /login|oauth token (has )?(expired|revoked)|authentication_error|invalid api key|401 unauthorized`)
-	reLimit   = regexp.MustCompile(`(?i)hit your (\w+[- ])?limit|(usage|session|weekly|daily|\d+-hour) limit (reached|hit)|limit reached\s*[·∙•|]|out of (extra )?usage|^rate_limit: `)
-	reTrans   = regexp.MustCompile(`(?i)api error: (5\d\d|429|529)\b|bedrock is unable to process|can't reach the api server|server error mid-response|unexpected error during processing|connection (refused|error|reset|closed)|request timed out|timed out|overloaded|econnreset|eai_again|enotfound|fetch failed|socket hang up|network error|throttl|too many requests|service unavailable|internal server error|bad gateway|gateway time-?out`)
+	// The network's edge in front of the API turned the request away with its own page (Cloudflare's "Attention
+	// Required!"). The harness prints its login hint with it, but the login is not what failed: it passes by itself.
+	reEdge  = regexp.MustCompile(`(?i)attention required!? \| cloudflare`)
+	reOrg   = regexp.MustCompile(`(?i)organization has disabled|disabled (claude )?subscription access|ask your admin to enable`)
+	reLogin = regexp.MustCompile(`(?i)login expired|not logged in|please run /login|oauth token (has )?(expired|revoked)|authentication_error|invalid api key|401 unauthorized`)
+	reLimit = regexp.MustCompile(`(?i)hit your (\w+[- ])?limit|(usage|session|weekly|daily|\d+-hour) limit (reached|hit)|limit reached\s*[·∙•|]|out of (extra )?usage|^rate_limit: `)
+	reTrans = regexp.MustCompile(`(?i)api error: (5\d\d|429|529)\b|bedrock is unable to process|can't reach the api server|server error mid-response|unexpected error during processing|connection (refused|error|reset|closed)|request timed out|timed out|overloaded|econnreset|eai_again|enotfound|fetch failed|socket hang up|network error|throttl|too many requests|service unavailable|internal server error|bad gateway|gateway time-?out`)
 )
 
 // ErrorClass says what an API error that ended a turn is, or "" for one never tried again blindly.
@@ -27,6 +30,8 @@ func ErrorClass(text string) string {
 	switch {
 	case text == "", reNoRetry.MatchString(text):
 		return ""
+	case reEdge.MatchString(text):
+		return Transient
 	case reOrg.MatchString(text):
 		return Org
 	case reLogin.MatchString(text):
