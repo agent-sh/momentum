@@ -261,19 +261,20 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 	if !holdsText(fix) {
 		fix = ""
 	}
-	// A report that names another case as the holder of this case's cause, and no place of its own to build in:
-	// the case follows that one when the root rule allows it (rootFor), and the report's place is then no hold.
+	// A report that names another case as the holder of this case's cause: the case follows that one when the
+	// root rule allows it (rootFor), and what the report says of its own repository or place is then left out. A
+	// same_as the rule does not take leaves the report as it is, with whatever place it named.
 	follows, notTaken := "", ""
-	if reported && mechanism != "" && f.Repo == "" && f.Config == "" && holdsText(f.SameAs) {
+	if reported && mechanism != "" && holdsText(f.SameAs) {
 		c, err := st.CaseByID(ctx, caseID)
 		if err != nil {
 			return store.Case{}, false, err
 		}
-		if follows, notTaken, err = rootFor(ctx, st, c, f.SameAs); err != nil {
+		if follows, notTaken, err = rootFor(ctx, st, c, f.SameAs, f.Repo != "" || f.Config != ""); err != nil {
 			return store.Case{}, false, err
 		}
 		if follows != "" {
-			f.Place, f.NothingToFix = "", false
+			f.Repo, f.Config, f.Place, f.NothingToFix = "", "", "", false
 			if fix == "" {
 				fix = followsFix // a case in testing says what its fix is
 			}

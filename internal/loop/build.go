@@ -334,7 +334,11 @@ func waitingRepoNote(c store.Case, hold string, at time.Time) store.Note {
 		// nothing here is a person's to do: the note says where the fix is built and what ends the wait
 		root, _, _ := strings.Cut(rest, ":")
 		n.Title = "The loop's case " + c.ID + " follows case " + root + ": one cause"
-		n.Detail = "Its investigation found the cause that case " + root + " holds. The fix is built under that case, and none here. " +
+		where := "The fix is built under that case, and none here. "
+		if strings.HasSuffix(hold, followPlaced) {
+			where = "That case's fix is a person's to make, and nothing is built here. "
+		}
+		n.Detail = "Its investigation found the cause that case " + root + " holds. " + where +
 			"When case " + root + " closes with its problem gone, this case closes with it; when it closes any other way, this case is investigated again."
 		return n
 	}
