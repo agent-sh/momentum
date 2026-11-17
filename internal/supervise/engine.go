@@ -226,9 +226,13 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		tries[RuleOverdue] = h.overdueTries(stop, ownerAt)
 		d := Decide(stop, tries, sv.Params, probe, now)
 		shut := false // the rule would have acted, and a case of this stop keeps it from sending
+		until := "the session moves on or its owner comes back"
 		if d.Rule != "" && d.Verdict != Case && d.Verdict != Skip && h.closed(d.Rule, ownerAt, reopened) {
 			shut = d.Verdict == Act
 			d.Verdict, d.Why = Case, "a case is open since the owner's last turn"
+			if i, _ := h.closedBy(d.Rule, ownerAt, reopened); !h.lifts(i, ownerAt) {
+				until = "its owner comes back"
+			}
 		}
 		if d.Verdict == Skip && d.Rule == "" {
 			d.Rule = planRules(stop, Tries{}, sv.Params, probe).Rule // the rule a guard keeps from acting, if any
@@ -295,7 +299,7 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 				}
 			} else if shut {
 				// said once for the stop, dated at it, so a rule a case keeps shut is not silent
-				e := sv.note(s, KindSkip, "shut:"+d.Rule, s.Since, d.Rule+": a case is open for this stop, so nothing is sent until the session moves on or its owner comes back")
+				e := sv.note(s, KindSkip, "shut:"+d.Rule, s.Since, d.Rule+": a case is open for this stop, so nothing is sent until "+until)
 				if err := sv.put(ctx, []store.Event{e}); err != nil {
 					return lines, err
 				}
@@ -576,7 +580,7 @@ func (sv *Supervisor) leftover(ctx context.Context, s *sessions.Session, stop St
 		m["late"], line.Err = err.Error(), err.Error()
 		e.Summary = oneLine(fmt.Sprintf("%s: not sent (%s; then %v): %q", RuleStalled, first, err, text))
 		c := Stop{At: time.UnixMilli(int64(num(m["stop_at"]))), Error: str(m["error"])}
-		evs = append(evs, sv.openCase(ctx, s, c, RuleStalled, "pasted, not known to be submitted: "+first+"; then: "+err.Error(), num(m["try"]), sv.now()))
+		evs = append(evs, sv.openCase(ctx, s, c, RuleStalled, reasonPasted+": "+first+"; then: "+err.Error(), num(m["try"]), sv.now()))
 	}
 	e.Meta = meta(m)
 	return line, sv.put(ctx, append([]store.Event{e}, evs...))
@@ -722,10 +726,12 @@ type caseRec struct {
 	going  bool   // its rule keeps sending: the case is on record, and does not close the rule
 }
 
-// The cases about the session's input line, not about one stop: a turn of the session's own changes neither.
+// The cases about the session's input line, not about one stop: a turn of the session's own changes neither. And
+// the case of a message that did not show up, which is about the stop unless the one before it was the same.
 const (
-	reasonPasted = "pasted, not known to be submitted" // the paste may still sit on the line
-	reasonNoWay  = "no way to type into it"
+	reasonPasted       = "pasted, not known to be submitted" // the paste may still sit on the line
+	reasonNoWay        = "no way to type into it"
+	reasonNotDelivered = "not delivered"
 )
 
 func history(evs []store.Event) past {
@@ -856,27 +862,63 @@ func runOwner(key string) string {
 // or until the session moves on from the stop the case was about (reopened): a session nobody types into, which
 // its own scheduled runs drive, would otherwise keep the rule shut for good. A going case does not close its rule.
 func (h past) closed(rule string, ownerAt time.Time, reopened map[string]time.Time) bool {
-	for _, c := range h.cases {
-		if c.rule == rule && c.at.After(ownerAt) && c.at.After(reopened[rule]) && !c.going {
-			return true
+	_, ok := h.closedBy(rule, ownerAt, reopened)
+	return ok
+}
+
+// closedBy is the newest case that closes the rule (closed), by its place in the cases.
+func (h past) closedBy(rule string, ownerAt time.Time, reopened map[string]time.Time) (int, bool) {
+	for i := len(h.cases) - 1; i >= 0; i-- {
+		if c := h.cases[i]; c.rule == rule && c.at.After(ownerAt) && c.at.After(reopened[rule]) && !c.going {
+			return i, true
 		}
 	}
-	return false
+	return -1, false
+}
+
+// lifts reports whether a turn of the session's own lifts the closing case at i (reopened). It does not lift an
+// overdue case: that is about one job's runs, which another job's turn says nothing of, and its tries already
+// count from that job's last run (overdueTries). Nor a case about the input line: a session nothing can type into
+// would get a case at each of its runs, and a paste may still sit there. Nor a second message in a row that did
+// not show up, with none of the rule's delivered since the first: its messages do not reach the session, and each
+// of its runs would cost a message, a case and a notice.
+func (h past) lifts(i int, ownerAt time.Time) bool {
+	if i < 0 || i >= len(h.cases) {
+		return false
+	}
+	c := h.cases[i]
+	if c.going || c.rule == RuleOverdue || c.reason == reasonNoWay || c.reason == reasonPasted {
+		return false
+	}
+	if c.reason != reasonNotDelivered {
+		return true
+	}
+	for j := i - 1; j >= 0; j-- {
+		p := h.cases[j]
+		if p.going || p.rule != c.rule {
+			continue
+		}
+		if p.reason != reasonNotDelivered || !p.at.After(ownerAt) {
+			return true
+		}
+		for _, s := range h.sends {
+			if s.rule == c.rule && s.at.After(p.at) && s.at.Before(c.at) && s.result[Delivered] {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 // reopened is, by rule, when the newest case that closed it stopped holding: a turn began after the case, so the
 // session moved on from the stop the case was about, and a stop since is a new episode with tries of its own.
-// The turn dates from what opened it (began): a message that lands after its own case is still that stop's. A harness that does not date its turns reopens nothing. Nor does a turn for the overdue
-// rule: its case is about one job's runs, which another job's turn says nothing of, and its tries already count
-// from that job's last run (overdueTries). Nor does a case about the input line: a session nothing can type into
-// would get a case at each of its runs, and a paste may still sit there.
+// The turn dates from what opened it (began): a message that lands after its own case is still that stop's. A
+// harness that does not date its turns reopens nothing, and some cases no turn lifts (lifts).
 func (h past) reopened(ownerAt, turnBegan time.Time) map[string]time.Time {
 	out := map[string]time.Time{}
-	for _, c := range h.cases {
-		if c.going || c.rule == RuleOverdue || c.reason == reasonNoWay || c.reason == reasonPasted {
-			continue
-		}
-		if c.at.After(ownerAt) && turnBegan.After(c.at) && c.at.After(out[c.rule]) {
+	for i, c := range h.cases {
+		if h.lifts(i, ownerAt) && c.at.After(ownerAt) && turnBegan.After(c.at) && c.at.After(out[c.rule]) {
 			out[c.rule] = c.at
 		}
 	}
@@ -889,7 +931,9 @@ func (h past) reopened(ownerAt, turnBegan time.Time) map[string]time.Time {
 // nowhere.
 func (h past) began(s *sessions.Session) time.Time {
 	text := lastUser(s)
-	if s.TurnBegan.Sub(s.UserAt).Abs() > 2*time.Second || !h.ours(text) {
+	// the last input came with the turn or after its start (a harness may record the start first, by seconds):
+	// one long before it opened an earlier turn
+	if s.UserAt.Before(s.TurnBegan.Add(-2*time.Second)) || !h.ours(text) {
 		return s.TurnBegan
 	}
 	text = fold(text)
@@ -1074,8 +1118,8 @@ func (sv *Supervisor) outcome(ctx context.Context, s *sessions.Session, stop Sto
 			*put = append(*put, mk(Delivered))
 		case now.Sub(l.at) >= DeliveryWait:
 			c := Stop{At: l.stopAt, Error: stop.Error}
-			*put = append(*put, mk(NotDelivered), sv.openCase(ctx, s, c, l.rule, "not delivered: the message did not show up as its turn", l.try, now))
-			h.cases = append(h.cases, caseRec{at: now, rule: l.rule, stopAt: l.stopAt, reason: "not delivered"}) // closed from this run on
+			*put = append(*put, mk(NotDelivered), sv.openCase(ctx, s, c, l.rule, reasonNotDelivered+": the message did not show up as its turn", l.try, now))
+			h.cases = append(h.cases, caseRec{at: now, rule: l.rule, stopAt: l.stopAt, reason: reasonNotDelivered}) // closed from this run on
 			return true
 		default:
 			return false

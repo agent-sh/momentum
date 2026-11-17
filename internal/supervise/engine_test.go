@@ -133,13 +133,13 @@ func lands(s *sessions.Session, text string, at time.Time, work bool) {
 	if work {
 		s.Log.Add(sessions.Entry{Role: sessions.RoleTool, Name: "Bash", Text: "make notes"})
 	}
-	s.UserAt, s.Seq = at, s.Log.Seq()
+	s.UserAt, s.TurnBegan, s.Seq = at, at, s.Log.Seq() // an input opens a turn, as the trackers date it
 }
 
 // typed is the owner typing into the session at.
 func typed(s *sessions.Session, text string, at time.Time) {
 	s.Log.Add(sessions.Entry{Role: sessions.RoleUser, Text: text})
-	s.UserAt, s.Seq = at, s.Log.Seq()
+	s.UserAt, s.TurnBegan, s.Seq = at, at, s.Log.Seq()
 }
 
 func TestATransientErrorWaitsThenSendsThenFollowsTheOutcome(t *testing.T) {
@@ -1451,5 +1451,60 @@ func TestAnEpisodeAfterAClosedCaseNotesItsOwnGoingCase(t *testing.T) {
 	}
 	if going() != 2 {
 		t.Fatalf("going cases after the new episode's waits ran out: %d, want 2", going())
+	}
+}
+
+// A paste that may still sit on the input line: one case across the session's own runs, and the note for the shut
+// rule says only its owner lifts it.
+func TestAPasteThatMaySitOnTheLineKeepsItsRuleShutAcrossTheSessionsOwnRuns(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{send: act.ErrUnstable}
+	now := t0.Add(10 * time.Minute)
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	for round := 0; round < 4; round++ {
+		for i := 0; i < 5; i++ {
+			run(t, sv, s)
+			now = now.Add(time.Minute)
+		}
+		s.TurnBegan, s.Since = now, now.Add(time.Minute)
+		now = now.Add(3 * time.Minute)
+	}
+	if cases := events(t, st, KindCase); len(cases) != 1 {
+		t.Fatalf("cases %d, want one: %+v", len(cases), cases)
+	}
+	shut := 0
+	for _, e := range events(t, st, KindSkip) {
+		if strings.Contains(e.Summary, "a case is open for this stop") {
+			shut++
+			if !strings.HasSuffix(e.Summary, "until its owner comes back") {
+				t.Fatalf("the shut note names an end the case does not have: %q", e.Summary)
+			}
+		}
+	}
+	if shut == 0 {
+		t.Fatal("the shut rule was never said")
+	}
+}
+
+// A session where no message ever shows up, which its own runs drive: the rule tries the next episode once, and a
+// second message that did not show up keeps it shut. Each of the session's runs would else cost a message, a case
+// and a notice.
+func TestTwoMessagesInARowThatDidNotShowUpKeepTheRuleShut(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0.Add(10 * time.Minute)
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	for round := 0; round < 6; round++ {
+		for i := 0; i < 8; i++ { // sent, in flight, then not delivered: a case
+			run(t, sv, s)
+			now = now.Add(time.Minute)
+		}
+		s.TurnBegan, s.Since = now, now.Add(time.Minute) // a run of the session's own, ending on the same error
+		now = now.Add(3 * time.Minute)
+	}
+	if cases := events(t, st, KindCase); len(f.sent) != 2 || len(cases) != 2 {
+		t.Fatalf("sent %d and %d cases over six of the session's runs, want 2 and 2", len(f.sent), len(cases))
 	}
 }
