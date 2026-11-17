@@ -1655,12 +1655,14 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 // testsRunLast reads the test files of the loop's test file's package in a tree and says why the loop's tests would
 // not run after every other test there (runLast), or "".
 func (s *Ship) testsRunLast(ctx context.Context, p Package, tree, own string) (string, error) {
-	list, err := s.git(ctx, p.Host, "ls-tree", "--name-only", tree, "--", path.Dir(own)+"/")
+	// names end with a NUL (-z): git quotes a name with a byte it does not print, and a quoted name would not read
+	// as a test file's
+	list, err := s.git(ctx, p.Host, "ls-tree", "-z", "--name-only", tree, "--", path.Dir(own)+"/")
 	if err != nil {
 		return "", err
 	}
 	files := map[string][]byte{}
-	for _, name := range strings.Fields(list) {
+	for _, name := range strings.Split(list, "\x00") {
 		if !strings.HasSuffix(name, "_test.go") {
 			continue
 		}

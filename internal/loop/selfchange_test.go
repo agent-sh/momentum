@@ -168,15 +168,17 @@ func TestTheLoopsTestsRunLast(t *testing.T) {
 		t.Fatalf("a package whose tests run in the files' order: %q", why)
 	}
 	for name, c := range map[string]struct{ file, body, why string }{
-		"a later file":                 {"zzz_test.go", other, "sorts after"},
-		"the external test package":    {"ext_test.go", strings.Replace(other, "package p", "package p_test", 1), "another package"},
-		"a TestMain":                   {"a_test.go", other + "\nfunc TestMain(m *testing.M) {}\n", "TestMain"},
-		"a fuzz test":                  {"a_test.go", other + "\nfunc FuzzX(f *testing.F) {}\n", "FuzzX"},
-		"an example":                   {"a_test.go", other + "\nfunc ExampleX() {}\n", "ExampleX"},
-		"a parallel test":              {"a_test.go", other + "\nfunc TestP(t *testing.T) { t.Parallel() }\n", "parallel"},
-		"a parallel subtest":           {"a_test.go", other + "\nfunc TestP(t *testing.T) {\n\tt.Run(\"s\", func(u *testing.T) { u.Parallel() })\n}\n", "parallel"},
-		"a file that does not parse":   {"a_test.go", "package p\n\nfunc {\n", "does not parse"},
-		"the loop's file not among it": {"zz_loop_test.go", "", "not among"},
+		"a later file":                    {"zzz_test.go", other, "sorts after"},
+		"the external test package":       {"ext_test.go", strings.Replace(other, "package p", "package p_test", 1), "another package"},
+		"a TestMain":                      {"a_test.go", other + "\nfunc TestMain(m *testing.M) {}\n", "TestMain"},
+		"a fuzz test":                     {"a_test.go", other + "\nfunc FuzzX(f *testing.F) {}\n", "FuzzX"},
+		"an example":                      {"a_test.go", other + "\nfunc ExampleX() {}\n", "ExampleX"},
+		"a parallel test":                 {"a_test.go", other + "\nfunc TestP(t *testing.T) { t.Parallel() }\n", "parallel"},
+		"a parallel subtest":              {"a_test.go", other + "\nfunc TestP(t *testing.T) {\n\tt.Run(\"s\", func(u *testing.T) { u.Parallel() })\n}\n", "parallel"},
+		"Parallel as a method expression": {"a_test.go", other + "\nfunc TestP(t *testing.T) { (*testing.T).Parallel(t) }\n", "parallel"},
+		"Parallel as a method value":      {"a_test.go", other + "\nfunc TestP(t *testing.T) {\n\tp := t.Parallel\n\tp()\n}\n", "parallel"},
+		"a file that does not parse":      {"a_test.go", "package p\n\nfunc {\n", "does not parse"},
+		"the loop's file not among it":    {"zz_loop_test.go", "", "not among"},
 	} {
 		files := map[string][]byte{"a_test.go": []byte(other), "zz_loop_test.go": []byte(own)}
 		files[c.file] = []byte(c.body)

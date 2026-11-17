@@ -144,6 +144,7 @@ func TestTheLoopReadsAChangeToItsOwnFiles(t *testing.T) {
 	// where one does not, the loop's test file is a person's again, though its change only appends.
 	for name, more := range map[string]map[string]string{
 		"a test file that sorts after the loop's": {"internal/supervise/zzz_later_test.go": selfOther},
+		"a test file whose name git would quote":  {"internal/supervise/zzé_test.go": selfOther},
 		"a test that runs in parallel":            {"internal/supervise/par_test.go": "package supervise\n\nimport \"testing\"\n\nfunc TestPar(t *testing.T) { t.Parallel() }\n"},
 		"a file of the external test package":     {"internal/supervise/ext_test.go": "package supervise_test\n\nimport \"testing\"\n\nfunc TestExt(t *testing.T) {}\n"},
 	} {
@@ -173,11 +174,12 @@ func TestTheRulesPackagesOwnTestsMustStillPass(t *testing.T) {
 		// the old test wants a positive limit; the build's command names only its new test
 		"an old test broken": {strings.Replace(selfRules, "limit = 1", "limit = 0", 1),
 			"\nfunc TestLimitIsZero(t *testing.T) {\n\tif Limit() != 0 {\n\t\tt.Fatal(Limit())\n\t}\n}\n", []string{"go", "test", "-run", "TestLimitIsZero", "./..."}},
-		// the build's command puts the old limit back in the tree it ran in, once its own test has passed: the suite
-		// runs on an export of its own, where the change is as it was
+		// the build's command, once its own test has passed, puts the old limit back in the tree it ran in and turns
+		// its added test to match: a suite run there would pass. The suite runs on an export of its own, where the
+		// change is as it was
 		"a command that rewrites the tree it ran in": {strings.Replace(selfRules, "limit = 1", "limit = 0", 1),
 			"\nfunc TestLimitIsZero(t *testing.T) {\n\tif Limit() != 0 {\n\t\tt.Fatal(Limit())\n\t}\n}\n", []string{"go", "test", "-run", "TestLimitIsZero", "-exec",
-				`/bin/sh -c '"$@" && sed -i "s/limit = 0/limit = 1/" /work/internal/supervise/rules.go' sh`, "./internal/supervise"}},
+				`/bin/sh -c '"$@" && sed -i "s/limit = 0/limit = 1/" /work/internal/supervise/rules.go && sed -i "s/Limit() != 0/Limit() != 1/" /work/` + rulesTestPath + `' sh`, "./internal/supervise"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, _, _, cs, p := selfFixture(t)
@@ -257,5 +259,29 @@ func TestALandingReadsTheChangeAgain(t *testing.T) {
 		if err := s.selfLanding(ctx, p, p.Head); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), rulesTestPath) {
 			t.Fatalf("the read after a rebase: %v", err)
 		}
+	}
+}
+
+// The read after a rebase is of the rebased change on the base it now stands on: a base that gained, since the
+// review, a test that runs in parallel makes the loop's test file a person's, and nothing lands.
+func TestARebasedChangeIsReadOnItsNewBase(t *testing.T) {
+	ctx := context.Background()
+	s, _, f, c, p := selfFixture(t)
+	write(t, filepath.Join(p.Work, rulesPath), strings.Replace(selfRules, "limit = 1", "limit = 2", 1))
+	write(t, filepath.Join(p.Work, rulesTestPath), selfRulesTest+selfNewTest)
+	if _, err := s.CheckArgs(ctx, c.ID, []string{"go", "test", "-run", "TestLimitIsTwo", "./..."}, nil, fixturePatch(t, s, c.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "The limit is two", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
+		t.Fatalf("a clean review: %+v %v", p, err)
+	}
+	pushOther(t, f, "main", map[string]string{"internal/supervise/par_test.go": "package supervise\n\nimport \"testing\"\n\nfunc TestPar(t *testing.T) { t.Parallel() }\n"})
+	base := originHead(t, f, "main")
+	s.Live = true
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), rulesTestPath) || originHead(t, f, "main") != base {
+		t.Fatalf("a base that gained a parallel test: %v", err)
 	}
 }

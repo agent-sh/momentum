@@ -232,9 +232,10 @@ func added(was, now []string) []string {
 // the package's test files by name. The go command runs a package's tests file by file in the order of their
 // names, and a file's in the order it holds them; these change that, and are refused in the other files: a file
 // whose name sorts after own, a file of the package's external test package (run after the package's own), a
-// TestMain (it decides what runs), a fuzz test or an example (run after the tests), and a test that calls Parallel
-// (it waits for the others to end). A person's run with -shuffle or a count above one orders them otherwise; the
-// host's does not.
+// TestMain (it decides what runs), a fuzz test or an example (run after the tests), and a test that names Parallel
+// (it waits for the others to end), however it calls it. This reads the test files' form: a Parallel reached
+// through a helper in another file is not seen. A person's run with -shuffle or a count above one orders them
+// otherwise; the host's does not.
 func runLast(files map[string][]byte, own string) string {
 	if files[own] == nil {
 		return own + " is not among the package's test files"
@@ -268,8 +269,8 @@ func runLast(files map[string][]byte, own string) string {
 				if n.Recv == nil && (n.Name.Name == "TestMain" || strings.HasPrefix(n.Name.Name, "Fuzz") || strings.HasPrefix(n.Name.Name, "Example")) {
 					why = name + " holds " + n.Name.Name + ", which does not run in the files' order"
 				}
-			case *ast.CallExpr:
-				if sel, ok := n.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Parallel" && len(n.Args) == 0 {
+			case *ast.SelectorExpr: // t.Parallel(), (*testing.T).Parallel(t), p := t.Parallel
+				if n.Sel.Name == "Parallel" {
 					why = name + " holds a test that runs in parallel, after the others end"
 				}
 			}
