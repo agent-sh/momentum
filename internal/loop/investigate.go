@@ -49,11 +49,15 @@ func (r *Runner) investigationQuestion(c store.Case) string {
 // gate's own lists), so that a fix that needs one is reported as a place and waits for a person with the path
 // named, instead of a build that is paid for only to answer that its fix is out of reach.
 func ownReachQuestion() string {
-	return " In the loop's own repository (" + SelfRepo + ", under whichever NAME /ro/repos holds it), no build may change CI configuration (" +
-		strings.Join(ciPaths, ", ") + ") or these paths, which the loop's measurement and its event scanners rest on: " +
-		strings.Join(ProposalProtected(), ", ") + " (of internal/supervise/, rules.go and test files may change). " +
-		"A fix that needs one of them is not the loop's to build: report place as that path in the repository, and no repo."
+	return " A fix you name a repo for is built there by a later run. No such run changes CI configuration (" +
+		strings.Join(ciPaths, ", ") + ") in any repository, and in the repository " + SelfRepo + " (under whichever NAME /ro/repos holds it) none changes these paths, " +
+		"which this system's own measurement and event scanners rest on: " + strings.Join(ProposalProtected(), ", ") + " " + ownReachException + ". " +
+		"A fix that needs one of those paths in that repository, when nothing outside them fixes the case, is for a person to make: " +
+		"report place as the paths and the repository (such as internal/loop/gate.go in " + SelfRepo + "), and no repo."
 }
+
+// ownReachException is the one part of a protected directory a build may change, as a build is told it (buildScope).
+const ownReachException = "(of internal/supervise/, rules.go and test files may change)"
 
 // configTargetsFor says an investigation of a case may name a configuration file: configuration targets are on, and
 // the case is not one of component health, whose fixes are the loop's own.

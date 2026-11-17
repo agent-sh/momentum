@@ -211,18 +211,30 @@ func TestAWordForNoneNamesNoPlace(t *testing.T) {
 }
 
 // A live investigation is told which paths of the loop's own repository no build may change, in the gate's own
-// words, and to report a fix that needs one as a place. The evaluation's question is the plain one.
+// words and with the one exception a build is told, and to report a fix that needs one as a place naming the paths
+// and the repository. Such a place's note stands as high as the hold for a person it takes the place of.
 func TestAnInvestigationIsToldWhatNoBuildMayChange(t *testing.T) {
 	st := testStore(t)
 	r := localRunner(t, st)
 	c := openCase(t, st, "failures", "own-reach", 1)
 	q := r.investigationQuestion(c)
-	for _, want := range append(append([]string{SelfRepo, "report place as that path"}, ProposalProtected()...), ciPaths...) {
+	for _, want := range []string{SelfRepo, strings.Join(ProposalProtected(), ", "), strings.Join(ciPaths, ", "), ownReachException,
+		"when nothing outside them fixes the case", "report place as the paths and the repository"} {
 		if !strings.Contains(q, want) {
-			t.Errorf("the question does not name %q", want)
+			t.Errorf("the question does not hold %q", want)
 		}
+	}
+	if !strings.Contains(buildScope(SelfRepo), ownReachException) {
+		t.Error("a build is told another exception than an investigation")
 	}
 	if !strings.HasPrefix(q, liveQuestion) || strings.Contains(liveQuestion, SelfRepo) {
 		t.Fatalf("the plain question changed, or is not where the live one begins")
+	}
+	own := waitingRepoNote(store.Case{ID: "c1", Family: "failures", NextTest: "key on the error's own line"}, repoHold("internal/detect/failures.go in "+SelfRepo), time.Now())
+	if own.Importance != store.ImportanceNormal || !strings.Contains(own.Title, "internal/detect/failures.go") {
+		t.Fatalf("the note of a fix in the loop's own protected paths: %+v", own)
+	}
+	if far := waitingRepoNote(store.Case{ID: "c1", Family: "failures", NextTest: "a fix"}, repoHold("another project"), time.Now()); far.Importance != store.ImportanceLow {
+		t.Fatalf("the note of a fix elsewhere: %+v", far)
 	}
 }

@@ -312,7 +312,7 @@ func (r *Runner) caseFixPlace(ctx context.Context, c store.Case) (repo, config, 
 // opens the hold of one whose investigation named a place the loop does not build in.
 const (
 	noRepoHold      = "waits for a repository: the investigation named none"
-	elsewherePrefix = "its fix is outside the loop's repositories: "
+	elsewherePrefix = "its fix is out of the loop's reach: "
 )
 
 // repoHold is the hold of a case in testing with no repository or configuration file to build in, by the place its
@@ -332,6 +332,11 @@ func waitingRepoNote(c store.Case, hold string, at time.Time) store.Note {
 		Detail: "The investigation named no code repository or configuration file. The case stays in testing without a build run.", At: at}
 	if place, ok := strings.CutPrefix(hold, elsewherePrefix); ok {
 		n.Title = plainClip("The fix for case "+c.ID+" is outside the loop's reach: "+place, 120)
+		if strings.Contains(place, SelfRepo) {
+			// a path of the loop's own repository that no build may change: as high in the report as the hold for a
+			// person that a build's out-of-reach answer leaves, which this takes the place of
+			n.Importance = store.ImportanceNormal
+		}
 		done := "momentum case close " + c.ID + " --reason already-solved --why WHY"
 		if c.Family == store.HealthFamily { // which closes naming what fixed it
 			done = "momentum case close " + c.ID + " --reason already-solved --fix REF --why WHY"
@@ -846,7 +851,7 @@ func buildScope(repo string) string {
 		strings.Join(SelfLandable(), ", ") + ": prefer a fix inside them. A fix that needs other paths is still checked and reviewed, " +
 		"then proposed for a person to land by hand; the loop never lands it. No change touches CI configuration (" + ci +
 		") or these, which the loop's measurement and its event scanners rest on: " + strings.Join(ProposalProtected(), ", ") +
-		" (of internal/supervise/, rules.go and test files may change)."
+		" " + ownReachException + "."
 }
 
 // reviewPrompt is a review's task. It carries the paths the build was given (buildScope), so a reviewer knows what the

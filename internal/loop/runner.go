@@ -1057,7 +1057,7 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 					r.keepHold(ctx, c, repoHold(place), true)
 				}
 				if place != "" {
-					passed = append(passed, c.ID+" waits for a repository: its fix is elsewhere")
+					passed = append(passed, c.ID+" waits for a repository: its fix is out of the loop's reach")
 				} else {
 					passed = append(passed, c.ID+" waits for a repository")
 				}
