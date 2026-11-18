@@ -264,7 +264,8 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 	// A report that names another case as the holder of this case's cause: the case follows that one when the
 	// root rule allows it (rootFor), and what the report says of its own repository or place is then left out. A
 	// same_as the rule does not take leaves the report as it is, with whatever place it named.
-	follows, notTaken := "", ""
+	var follows store.Case
+	notTaken, ownPlace := "", ""
 	if reported && mechanism != "" && holdsText(f.SameAs) {
 		c, err := st.CaseByID(ctx, caseID)
 		if err != nil {
@@ -273,7 +274,14 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 		if follows, notTaken, err = rootFor(ctx, st, c, f.SameAs, f.Repo != "" || f.Config != ""); err != nil {
 			return store.Case{}, false, err
 		}
-		if follows != "" {
+		if follows.ID != "" {
+			// what the report named for itself is left out of the record, and kept in a line: a repository other
+			// than the root's is the one sign in the report that the two causes may differ
+			for kind, own := range map[string]string{"repo ": f.Repo, "config ": f.Config, "place ": placeOf(f)} {
+				if own != "" {
+					ownPlace += kind + plainClip(plain.Line(own), placeMax) + "; "
+				}
+			}
 			f.Repo, f.Config, f.Place, f.NothingToFix = "", "", "", false
 			if fix == "" {
 				fix = followsFix // a case in testing says what its fix is
@@ -353,17 +361,26 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 		if f.Repo == "" && f.Config == "" { // a fix the loop can build has no other place
 			place = placeOf(f)
 		}
-		raw, err := json.Marshal(struct {
-			Repo    string `json:"repo"`
-			Config  string `json:"config,omitempty"`
-			Place   string `json:"place,omitempty"`
-			Follows string `json:"follows,omitempty"`
-			Episode int64  `json:"episode"`
-		}{f.Repo, f.Config, place, follows, episode})
+		record := struct {
+			Repo           string `json:"repo"`
+			Config         string `json:"config,omitempty"`
+			Place          string `json:"place,omitempty"`
+			Follows        string `json:"follows,omitempty"`
+			FollowsEpisode int64  `json:"follows_episode,omitempty"`
+			FollowsSum     string `json:"follows_sum,omitempty"`
+			Episode        int64  `json:"episode"`
+		}{Repo: f.Repo, Config: f.Config, Place: place, Episode: episode}
+		if follows.ID != "" {
+			record.Follows, record.FollowsEpisode, record.FollowsSum = follows.ID, follows.Episode, causeSum(follows)
+		}
+		raw, err := json.Marshal(record)
 		if err != nil {
 			return store.Case{}, false, err
 		}
 		notes = append(notes, store.CaseEntry{Action: repoAction, Detail: string(raw)})
+		if ownPlace != "" {
+			notes = append(notes, store.CaseEntry{Action: ownPlaceAction, Detail: strings.TrimSuffix(ownPlace, "; ")})
+		}
 		if notTaken != "" {
 			notes = append(notes, store.CaseEntry{Action: notTakenAction, Detail: notTaken})
 		}

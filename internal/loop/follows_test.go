@@ -102,6 +102,23 @@ func TestTheRootRuleKeepsFollowingToOneLevel(t *testing.T) {
 	follower := report(t, st, openCase(t, st, "failures", "follower", 1), `{"mechanism":"m","fix":"f","summary":"s","same_as":"`+root.ID+`"}`)
 	fresh := openCase(t, st, "failures", "not-investigated", 1)
 	health := openCase(t, st, store.HealthFamily, "health", 1)
+	closed := rootCase(t, st, "closed-root")
+	if _, err := st.CloseCase(ctx, closed.ID, store.NotWorthIt, "", "declined", "test"); err != nil {
+		t.Fatal(err)
+	}
+	blank, fixless := rootCase(t, st, "no-mechanism"), rootCase(t, st, "no-fix")
+	db, err := sql.Open("sqlite", st.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for id, column := range map[string]string{blank.ID: "mechanism", fixless.ID: "next_test"} {
+		if res, err := db.Exec("UPDATE cases SET "+column+" = '' WHERE id = ?", id); err != nil {
+			t.Fatal(err)
+		} else if n, _ := res.RowsAffected(); n != 1 {
+			t.Fatalf("setup: %s of %s", column, id)
+		}
+	}
 	for name, c := range map[string]struct {
 		of            store.Case
 		body          string
@@ -111,7 +128,11 @@ func TestTheRootRuleKeepsFollowingToOneLevel(t *testing.T) {
 		"itself":                                  {openCase(t, st, "failures", "self", 1), `"same_as":"SELF"`, "", "", "names the case itself"},
 		"a case that is not there":                {openCase(t, st, "failures", "ghost", 1), `"same_as":"c00000000"`, "", "", "no case c00000000"},
 		"no case's id":                            {openCase(t, st, "failures", "words", 1), `"same_as":"the other case, token AKIAABCDEXAMPLE"`, "", "", "names no case's id"},
-		"a case with no fix on record":            {openCase(t, st, "failures", "early", 1), `"same_as":"` + fresh.ID + `"`, "", "", "no cause and fix on record"},
+		"a case not investigated yet":             {openCase(t, st, "failures", "early", 1), `"same_as":"` + fresh.ID + `"`, "", "", "is open"},
+		"a closed case":                           {openCase(t, st, "failures", "late", 1), `"same_as":"` + closed.ID + `"`, "", "", "is closed"},
+		"a case with no cause on record":          {openCase(t, st, "failures", "blank", 1), `"same_as":"` + blank.ID + `"`, "", "", "no cause and fix on record"},
+		"a case with no fix on record":            {openCase(t, st, "failures", "fixless", 1), `"same_as":"` + fixless.ID + `"`, "", "", "no cause and fix on record"},
+		"two cases":                               {openCase(t, st, "failures", "two", 1), `"same_as":"not ` + root.ID + ` but ` + placed.ID + `"`, "", "", "more than one case"},
 		"a case that follows another":             {openCase(t, st, "failures", "chain", 1), `"same_as":"` + follower.ID + `"`, "", "", "itself follows case " + root.ID},
 		"a case that is followed":                 {root, `"repo":"momentum","same_as":"OTHER"`, "", "momentum", "follows this case"},
 		"a component-health case":                 {health, `"same_as":"` + root.ID + `"`, "", "", "component-health"},
@@ -120,7 +141,7 @@ func TestTheRootRuleKeepsFollowingToOneLevel(t *testing.T) {
 		// taken
 		"a root with a place":              {openCase(t, st, "failures", "to-place", 1), `"same_as":"` + placed.ID + `"`, placed.ID, "", ""},
 		"its own repository, a built root": {openCase(t, st, "failures", "both", 1), `"repo":"momentum","same_as":"` + root.ID + `"`, root.ID, "", ""},
-		"an id among other words":          {openCase(t, st, "failures", "forms", 1), `"same_as":"case ` + strings.ToUpper(root.ID) + ` (failures)"`, root.ID, "", ""},
+		"an id among other words":          {openCase(t, st, "failures", "forms", 1), `"same_as":"case_` + strings.ToUpper(root.ID) + ` (failures), ` + root.ID + `."`, root.ID, "", ""},
 	} {
 		body := strings.ReplaceAll(c.body, "SELF", c.of.ID)
 		if strings.Contains(body, "OTHER") {
@@ -151,6 +172,16 @@ func TestTheRootRuleKeepsFollowingToOneLevel(t *testing.T) {
 		}
 		if c.why == "" && said != "" || c.why != "" && !strings.Contains(said, c.why) || strings.Contains(said, "AKIA") {
 			t.Errorf("%s: the log says %q, want %q", name, said, c.why)
+		}
+		// a follow that left the report's own repository out keeps it in a line
+		kept := ""
+		for _, e := range log {
+			if e.Action == ownPlaceAction {
+				kept = e.Detail
+			}
+		}
+		if want := c.follows != "" && strings.Contains(c.body, `"repo"`); want != strings.Contains(kept, "repo momentum") {
+			t.Errorf("%s: the line of what the report named for itself: %q", name, kept)
 		}
 	}
 	// the follower still follows, and what it waits for says who makes the fix
@@ -270,7 +301,117 @@ func TestAnInvestigationIsShownTheCasesItMayFollow(t *testing.T) {
 		t.Fatal(err)
 	}
 	prompt, err := readHostInput(HostDir(prepared.Dir), "prompt.json")
-	if err != nil || !strings.Contains(string(prompt), "case "+root.ID+" (failures)") || !strings.Contains(string(prompt), "report same_as as that case's id") {
+	if err != nil || !strings.Contains(string(prompt), "case "+root.ID+" (failures, testing; its fix is made in repository momentum)") ||
+		!strings.Contains(string(prompt), "report same_as as that one case's id") {
 		t.Fatalf("the investigation's prompt names no case to follow: %v\n%s", err, prompt)
 	}
+}
+
+// A case with nowhere its fix is made is not shown as one to follow.
+func TestACaseWithNowhereItsFixIsMadeIsNotShown(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	placed := placedCase(t, st, "a-person's-fix")
+	nowhere := report(t, st, openCase(t, st, "failures", "no-place", 1), `{"mechanism":"m","fix":"f","summary":"s"}`)
+	text, err := siblingsText(ctx, st, openCase(t, st, "failures", "asks", 1))
+	if err != nil || strings.Contains(text, nowhere.ID) || !strings.Contains(text, "case "+placed.ID+" (failures, testing; its fix is made in a place outside the loop's repositories, for a person)") {
+		t.Fatalf("the cases shown: %v\n%s", err, text)
+	}
+}
+
+// A follower follows its root as the root stood when it was followed. It waits through a root sent back to be
+// investigated, stays with a root that concluded the same, and is investigated again when the root's investigation
+// records another cause or fix, when the root reopened, or when the root came to have nowhere its fix is made.
+// Its hold says who makes the root's fix.
+func TestAFollowerIsReadAgainstWhatItsRootHoldsNow(t *testing.T) {
+	ctx := context.Background()
+	follow := func(t *testing.T, root func(*store.Store) store.Case, own string) (*Runner, *store.Store, store.Case, store.Case, func() (string, string, store.Case)) {
+		t.Helper()
+		st := testStore(t)
+		r := localRunner(t, st)
+		r.Ship = &Ship{Store: st, Dir: r.Dir}
+		o := root(st)
+		f := report(t, st, openCase(t, st, "failures", "follower", 1), `{"mechanism":"m","fix":"f","summary":"s",`+own+`"same_as":"`+o.ID+`"}`)
+		if up, _ := followsOf(ctx, st, f); up != o.ID {
+			t.Fatalf("setup: the follower follows %q", up)
+		}
+		return r, st, o, f, func() (string, string, store.Case) {
+			t.Helper()
+			_, _, why, err := r.pick(ctx, f.Family, f.ID, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := st.CaseByID(ctx, f.ID)
+			log, _ := st.CaseLog(ctx, f.ID)
+			return why, store.HoldOf(got, log), got
+		}
+	}
+	built := func(st *store.Store) store.Case { return rootCase(t, st, "the-root") }
+	sentBack := func(st *store.Store, o store.Case, body string) {
+		t.Helper()
+		if _, err := st.UpdateCase(ctx, o.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "test"); err != nil {
+			t.Fatal(err)
+		}
+		if body != "" {
+			o, _ = st.CaseByID(ctx, o.ID)
+			report(t, st, o, body)
+		}
+	}
+	// a root with a place: the hold says a person makes its fix
+	_, _, o, _, pick := follow(t, func(st *store.Store) store.Case { return placedCase(t, st, "a-person's-fix") }, `"place":"somewhere",`)
+	if why, hold, _ := pick(); !strings.Contains(why, "follows "+o.ID) || hold != followHold(o.ID, false) {
+		t.Fatalf("a follower of a person's fix: %q %q", why, hold)
+	}
+	// a root sent back: the follower waits; the same conclusion again: it stays
+	_, st, o, _, pick := follow(t, built, `"repo":"momentum",`)
+	sentBack(st, o, "")
+	if why, hold, got := pick(); !strings.Contains(why, "follows "+o.ID) || hold != followHold(o.ID, true) || got.Status != store.CaseTesting {
+		t.Fatalf("a root being investigated again: %q %q %s", why, hold, got.Status)
+	}
+	o, _ = st.CaseByID(ctx, o.ID)
+	report(t, st, o, `{"mechanism":"the hook reviews each edit alone","fix":"review the edits of one message together","summary":"s","repo":"momentum"}`)
+	if why, _, got := pick(); !strings.Contains(why, "follows "+o.ID) || got.Status != store.CaseTesting {
+		t.Fatalf("a root that concluded the same: %q %s", why, got.Status)
+	}
+	// another cause: the follower is investigated again, and does not close with the root later
+	sentBack(st, o, `{"mechanism":"a different cause entirely","fix":"another fix","summary":"s","repo":"momentum"}`)
+	if why, hold, got := pick(); !strings.Contains(why, "holds another cause or fix now") || hold != "" || got.Status != store.CaseInvestigating {
+		t.Fatalf("a root that holds another cause: %q %q %s", why, hold, got.Status)
+	}
+	// a root that came to have nowhere its fix is made, with the cause it had
+	_, st, o, _, pick = follow(t, built, `"repo":"momentum",`)
+	if err := st.CaseNote(ctx, o.ID, repoAction, fmt.Sprintf(`{"repo":"","episode":%d}`, o.Episode), "test"); err != nil {
+		t.Fatal(err)
+	}
+	if why, _, got := pick(); !strings.Contains(why, "nowhere its fix is made now") || got.Status != store.CaseInvestigating {
+		t.Fatalf("a root with nowhere its fix is made: %q %s", why, got.Status)
+	}
+	// a root that closed and reopened: another episode
+	_, st, o, _, pick = follow(t, built, `"repo":"momentum",`)
+	if _, err := st.CloseCase(ctx, o.ID, store.Solved, "", "fixed by hand", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReopenCase(ctx, o.ID, []store.Evidence{{Ref: "file:/t/again", At: time.Now()}}, "it came back", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if why, _, got := pick(); !strings.Contains(why, "reopened since") || got.Status != store.CaseInvestigating {
+		t.Fatalf("a root that reopened: %q %s", why, got.Status)
+	}
+	// a root that is gone from the store, and one that came to follow a case itself
+	_, st, o, f, pick := follow(t, built, `"repo":"momentum",`)
+	if err := st.CaseNote(ctx, f.ID, repoAction, fmt.Sprintf(`{"repo":"","follows":"c00000000","episode":%d}`, f.Episode), "test"); err != nil {
+		t.Fatal(err)
+	}
+	if why, _, got := pick(); !strings.Contains(why, "is not in the store") || got.Status != store.CaseInvestigating {
+		t.Fatalf("a root that is not there: %q %s", why, got.Status)
+	}
+	_, st, o, f, pick = follow(t, built, `"repo":"momentum",`)
+	other := rootCase(t, st, "another-root")
+	if err := st.CaseNote(ctx, o.ID, repoAction, fmt.Sprintf(`{"repo":"","follows":"%s","episode":%d}`, other.ID, o.Episode), "test"); err != nil {
+		t.Fatal(err)
+	}
+	if why, _, got := pick(); !strings.Contains(why, "now follows case "+other.ID) || got.Status != store.CaseInvestigating {
+		t.Fatalf("a root that follows a case itself: %q %s", why, got.Status)
+	}
+	_ = f
 }
