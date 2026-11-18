@@ -282,9 +282,12 @@ func siblingsText(ctx context.Context, st *store.Store, c store.Case) (string, e
 	return b.String(), nil
 }
 
-// follow settles, at a pass's selection, a case in testing that follows root: it waits while the root is open; it
-// closes with a root that closed with its problem gone; and it goes back to be investigated when the root closed
-// any other way, went into another case, or came to follow one itself. It returns the line the pass shows.
+// follow settles, at a pass's selection, a case in testing that follows root. It waits while the root is open and
+// holds the cause and fix it was followed for, or is being investigated again. It closes with a root that closed
+// with its problem gone. It goes back to be investigated when the root closed any other way, is gone, reopened,
+// recorded another cause or fix, came to have nowhere its fix is made, or came to follow a case itself. A root
+// the loop does not build for now (held for a person, out of budget) keeps its followers waiting with it: the fix
+// is still that case's, and its hold is the one a person reads. It returns the line the pass shows.
 func (r *Runner) follow(ctx context.Context, c store.Case, root string, dry bool) (string, error) {
 	end := func(why string) (string, error) {
 		if !dry {

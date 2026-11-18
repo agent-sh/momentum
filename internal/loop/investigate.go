@@ -277,9 +277,9 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 		if follows.ID != "" {
 			// what the report named for itself is left out of the record, and kept in a line: a repository other
 			// than the root's is the one sign in the report that the two causes may differ
-			for kind, own := range map[string]string{"repo ": f.Repo, "config ": f.Config, "place ": placeOf(f)} {
-				if own != "" {
-					ownPlace += kind + plainClip(plain.Line(own), placeMax) + "; "
+			for _, own := range [][2]string{{"repo ", f.Repo}, {"config ", f.Config}, {"place ", placeOf(f)}} {
+				if own[1] != "" {
+					ownPlace += own[0] + plainClip(plain.Line(own[1]), placeMax) + "; "
 				}
 			}
 			f.Repo, f.Config, f.Place, f.NothingToFix = "", "", "", false

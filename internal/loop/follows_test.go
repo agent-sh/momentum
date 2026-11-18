@@ -368,6 +368,14 @@ func TestAFollowerIsReadAgainstWhatItsRootHoldsNow(t *testing.T) {
 	if why, hold, got := pick(); !strings.Contains(why, "follows "+o.ID) || hold != followHold(o.ID, true) || got.Status != store.CaseTesting {
 		t.Fatalf("a root being investigated again: %q %q %s", why, hold, got.Status)
 	}
+	// a run cut short leaves the root investigating with another mechanism in its findings: it has not concluded
+	if got, recorded, err := recordFindings(ctx, st, o.ID, o.Episode, finding{Mechanism: "a mechanism half found"}, false, "", "loop:cut"); err != nil || !recorded ||
+		got.Status != store.CaseInvestigating || causeSum(got) == causeSum(o) {
+		t.Fatalf("setup: the cut run: %s %v %v", got.Status, recorded, err)
+	}
+	if why, _, got := pick(); !strings.Contains(why, "follows "+o.ID) || got.Status != store.CaseTesting {
+		t.Fatalf("a root whose investigation was cut short: %q %s", why, got.Status)
+	}
 	o, _ = st.CaseByID(ctx, o.ID)
 	report(t, st, o, `{"mechanism":"the hook reviews each edit alone","fix":"review the edits of one message together","summary":"s","repo":"momentum"}`)
 	if why, _, got := pick(); !strings.Contains(why, "follows "+o.ID) || got.Status != store.CaseTesting {

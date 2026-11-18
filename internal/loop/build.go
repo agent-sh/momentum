@@ -339,7 +339,8 @@ func waitingRepoNote(c store.Case, hold string, at time.Time) store.Note {
 			where = "That case's fix is a person's to make, and nothing is built here. "
 		}
 		n.Detail = "Its investigation found the cause that case " + root + " holds. " + where +
-			"When case " + root + " closes with its problem gone, this case closes with it; when it closes any other way, this case is investigated again."
+			"When case " + root + " closes with its problem gone, this case closes with it; when it closes any other way, reopens or comes to hold another cause, this case is investigated again. " +
+			"While case " + root + " waits for a person, so does this one."
 		return n
 	}
 	if place, ok := strings.CutPrefix(hold, elsewherePrefix); ok {
