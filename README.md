@@ -252,6 +252,29 @@ Host `evidence show` scrubs all headers and whole records in one batch, then cli
 {"loop": {"config_targets": {"enabled": true, "allow": ["~/.config/agents/RULES.md"]}}}
 ```
 
+## Weekly scorecard
+
+```
+momentum weekly [--dry] [--week YYYY-Www] [--json]
+momentum weekly show [YYYY-Www]
+momentum weekly install [--dir DIR]
+momentum scorecard [--json]
+```
+
+Once a week momentum judges tacit and itself from their own records, and turns off a system that does not deliver. A week runs from Sunday 00:00 to Sunday 00:00 local time and is named by the ISO week of its Monday. `weekly install` writes `momentum-weekly.service` and a timer for Sunday 08:00 with `Persistent=true`, and enables nothing.
+
+The numbers are computed in code (`internal/scorecard`, which the loop may never change): tacit's hook blocks and the share that delivered, by hook and by session kind (interactive when the owner wrote in the session, headless when the store holds it otherwise, unknown when it holds nothing of it), hook run times from Claude Code's transcripts, distinct facts delivered, self-mark asks and marks, the judge's labels, MCP and navigation calls, and the owner's restatements: owner messages that cover most of an older curated fact's words, counted once, with copies, relays and pastes left out. Each comes with the four weeks before. For momentum: cases closed improved, changes landed, the loop's spend and the supervision outcomes.
+
+The rules:
+
+- tacit delivers in a week when, among delivered lines agents marked in interactive sessions, at least one was used and used lines are at least as many as not relevant ones, and the owner's restatements are not above the median of the four weeks before.
+- momentum delivers in a week when at least one case closed as improved.
+- Scoring starts with the first full week after the first run that is not dry. Two failing scored weeks in a row shut the system down.
+
+Shutting tacit down writes `$XDG_CONFIG_HOME/tacit/off` (the reason, the date, the week and the command that turns it back on) and disables its dreamer and curator timers. Shutting momentum down writes `off` in momentum's configuration directory, which the loop and supervision honor, and disables the loop's timer; ingest and the weekly run stay. Each shutdown leaves a high decided note with the numbers and the commands to turn it back on. A system found on again after a shutdown starts over.
+
+A model pass on the loop's agent ranks concrete changes to tacit from the numbers and samples of the worst deliveries and restatements. It never proposes promoting facts into agent rules files. Each change is a case of family `tacit`, which the loop never builds; next week's pass closes the ones the numbers show handled. The report goes to `weekly/YYYY-Www.md` under momentum's data directory, with one high decided note. `--dry` asks no model and writes no verdict, case, note or file.
+
 ## The ship tool
 
 The owner's CLI controls the same host package lifecycle:

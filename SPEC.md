@@ -747,6 +747,20 @@ Scorecard:
 
 Fewer questions does not count as success when it comes from unauthorized assumptions.
 
+## Weekly scorecard
+
+`momentum weekly` observes tacit and momentum over a week (Sunday to Sunday, local time, named by its Monday's ISO week) and judges each by a fixed rule in `internal/scorecard`. The loop never changes that package (ProposalProtected), so what judges a system is out of the system's reach.
+
+**Inputs.** tacit's delivery log (`<state>/delivery/<UTC day>.jsonl`: each hook block's hook, session, transcript, candidates and which it delivered, self-mark asks and marks, judge labels, navigation steps), tacit's store (curated facts: every fact outside `inbox`, `review`, `derived` and `keys`, by its description and owner's words), the hook records of Claude Code's transcripts (`hook_success` attachments of `tacit hook`: run time, and calls inside subagents), and momentum's store (owner messages, tacit's MCP tool calls, case logs, loop runs and spend, supervision outcomes). The log keeps a month, so the oldest of the four weeks before can be partial; the report marks it.
+
+**Restatements.** An owner message restates a fact when it shares at least four of the fact's distinct words, those carry at least 60% of the fact's word weight (inverse document frequency over the curated facts) and at least 25% of the message's, the fact has five words or more and was created before the message's day, and it was not made from the message's session. A message over 2000 characters, one that reads as a paste (a list, table, link, path or heading first, box drawing, more other characters than letters), a text that came before or into two sessions (a fork, a relayed broadcast), and a repeat in a session count for nothing. Precision over recall.
+
+**Rules.** tacit delivers when its interactive marks have used >= 1 and used >= not relevant, and its restatements are at most the median of the weeks before that momentum's store covers whole. momentum delivers when a case closed as improved. Verdicts are kept in `scorecard_weeks`; the deployment (the first run that is not dry) and each system's scoring start and shutdown in `scorecard_state`. Weeks that began before the scoring start are not scored. `FailingWeeks` (2) failing scored weeks in a row, adjacent by name, shut the system down; a system turned back on starts scoring again from then.
+
+**Shutdown.** The off-file comes first and alone stops the system (tacit honors `$XDG_CONFIG_HOME/tacit/off`; momentum's loop and supervision honor `off` in its configuration directory), then the system's spending timers are disabled (`tacit-dream*`, `tacit-curate*`; `momentum-loop*`). A high decided note says what was shut, why and how to turn it back on.
+
+**Advice.** One tool-free pass on the loop's agent (its runner, model, fallback and Bedrock relay, a judge's budget, inside the loop's weekly budget, scrubbed), over the report and samples, returns ranked changes and the open recommendations it finds handled. A change that names an agent rules file is dropped. Each change is a case of family `tacit` by its key (`tacit:KEY`); the loop refuses that family. A handled one closes as already solved.
+
 ## Milestones
 
 | | Deliverable | Exit condition |

@@ -324,7 +324,7 @@ func SelfLandable() []string { return slices.Clone(selfChanges) }
 // proposal a person lands by hand: what its measurement reads and decides with (the loop, its measurement, its sandbox
 // and the run's read-only reader with its case view, its configuration and paths, its commands), the scanners,
 // sources and detectors that write and judge the events it counts and the text normalization they share (sessions,
-// sources, the store, tool results, plain text, detectors, internal/supervise/ but its rules and their tests
+// sources, the store, the scorecard that judges momentum and tacit week by week, tool results, plain text, detectors, internal/supervise/ but its rules and their tests
 // (proposalProtected), the capacity run's files that record its events and reads, and the busy check the ship gate
 // uses, capacity's acts.go), its build (go.mod, go.sum,
 // go.work, go.work.sum, vendor/) and
@@ -333,7 +333,7 @@ func SelfLandable() []string { return slices.Clone(selfChanges) }
 // (ciPaths). Each call returns a list of its own.
 func ProposalProtected() []string {
 	return []string{"cmd/", "sessions/", "internal/loop/", "internal/measure/", "internal/sandbox/", "internal/ro/",
-		"internal/evidenceview/", "internal/config/", "internal/paths/", "internal/detect/", "internal/source/", "internal/store/",
+		"internal/evidenceview/", "internal/config/", "internal/paths/", "internal/detect/", "internal/source/", "internal/store/", "internal/scorecard/",
 		"internal/toolresult/", "internal/plain/", "internal/tracked/", "internal/capacity/run.go", "internal/capacity/record.go", "internal/capacity/acts.go", "internal/capacity/scratch_made.go", "internal/capacity/fsid.go",
 		"internal/supervise/", "go.mod", "go.sum", "go.work", "go.work.sum", "vendor/"}
 }

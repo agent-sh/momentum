@@ -57,9 +57,14 @@ CREATE INDEX IF NOT EXISTS case_evidence_ref ON case_evidence(ref);
 
 var caseIndexNames = []string{"case_signatures_case", "case_evidence_at", "case_evidence_ref"}
 
-// Families are the standing questions a case answers (SPEC, The questions it keeps asking).
+// Families are the standing questions a case answers (SPEC, The questions it keeps asking). TacitFamily's cases
+// are the weekly observation's recommendations for tacit: report-only, never built by the loop.
 var Families = []string{"owner-burden", "blind-spots", "manual-work", "sessions", "pressure", "capacity",
-	"component-health", "failures", "outside"}
+	"component-health", "failures", "outside", TacitFamily}
+
+// TacitFamily is the family of the weekly observation's recommendations for tacit (internal/scorecard). The loop
+// never investigates or builds one: tacit is outside its builds, and the next week's numbers close them.
+const TacitFamily = "tacit"
 
 // CaseStatus is where a case stands. It runs open, investigating, testing, deployed, measuring, then closed with a
 // reason.

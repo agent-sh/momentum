@@ -15,6 +15,7 @@ import (
 
 	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/paths"
+	"github.com/agent-sh/momentum/internal/scorecard"
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/internal/supervise"
 	"github.com/agent-sh/momentum/sessions"
@@ -47,8 +48,8 @@ func superviseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	case !errors.Is(err, config.ErrNoSources):
 		return err
 	}
-	if cfg.Supervise.Off {
-		return nil
+	if off, _ := scorecard.MomentumOff(); cfg.Supervise.Off || off {
+		return nil // off by the configuration, or by the scorecard's off-file (internal/scorecard)
 	}
 	live := supervise.Live
 	if cfg.Supervise.Live != nil {

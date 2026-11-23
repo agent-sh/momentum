@@ -11,7 +11,7 @@ import (
 	"os/exec"
 
 	"path/filepath"
-
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -19,6 +19,7 @@ import (
 	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
+	"github.com/agent-sh/momentum/internal/scorecard"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -170,9 +171,16 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if fs.NArg() > 0 {
 		return usageError{fmt.Sprintf("loop takes no arguments, got %q", fs.Arg(0))}
 	}
+	if off, why := scorecard.MomentumOff(); off && !*dry {
+		fmt.Fprintf(stderr, "momentum: the loop is off (%s); rm %s turns it back on\n", why, scorecard.MomentumOffFile())
+		return nil
+	}
 	c, err := config.Load()
 	if err != nil {
 		return err
+	}
+	if slices.Contains(c.Loop.Families, store.TacitFamily) || slices.Contains(strings.Split(*families, ","), store.TacitFamily) {
+		return usageError{"the tacit family is report-only: the weekly observation opens and closes its cases, and the loop never builds them"}
 	}
 	open := store.Open
 	var unlock func()
@@ -195,6 +203,11 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			return err
 		}
 		defer unlock()
+	}
+	if *only != "" {
+		if oc, err := st.CaseByID(ctx, *only); err == nil && oc.Family == store.TacitFamily {
+			return usageError{"case " + oc.ID + " is of the tacit family, which is report-only: the loop never builds it"}
+		}
 	}
 	r := selectionRunner(st, c.Loop)
 	if !*dry {

@@ -119,6 +119,18 @@ const usage = `usage:
                                         publish an unverified lesson to tacit
   momentum ship prepare|check|propose|status|land|rollback|withdraw --case ID [OPTIONS]
                                         the owner controls a host change package
+  momentum weekly [--dry] [--week YYYY-Www] [--json]
+                                        the week's observation of tacit and momentum from their own records: the
+                                        numbers, each system's verdict by the scorecard's fixed rule, a model pass
+                                        that ranks changes to tacit (each a case of family tacit), the report in
+                                        weekly/YYYY-Www.md and its note; two failing scored weeks in a row shut a
+                                        system down. A week runs Sunday to Sunday; --dry asks no model and writes no
+                                        row, file or note
+  momentum weekly show [YYYY-Www]       print a week's report, the newest by default
+  momentum weekly install [--dir DIR]   write the weekly unit and its timer (Sunday 08:00, Persistent); enables
+                                        nothing
+  momentum scorecard [--json]           where tacit and momentum stand: on or off, their scored weeks, how many
+                                        failed in a row and how many more shut the system down
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the
 capacity rules in its capacity section.
@@ -187,6 +199,10 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		err = shipCmd(ctx, args[1:], stdout, stderr)
 	case "loop":
 		err = loopCmd(ctx, args[1:], stdout, stderr)
+	case "weekly":
+		err = weeklyCmd(ctx, args[1:], stdout, stderr)
+	case "scorecard":
+		err = scorecardCmd(ctx, args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, "momentum", version)
 	case "-h", "--help", "help":
