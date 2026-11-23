@@ -849,16 +849,16 @@ func (h past) tries(ownerAt time.Time, reopened map[string]time.Time) Tries {
 // repeats counts the transient rule's messages in a row, since the owner's last turn, whose turn did work and then
 // met a transient error again (WorkedThenFailed): each such message ended its episode, and tries starts the next one
 // from zero, so only this count bounds how many such stops in a row the rule carries a session through without
-// him. A message whose turn worked and ended without an error ends the run, and so does a message of another rule
-// (its stop was another kind); a message that failed again with no work is part of its episode, and leaves the count
-// as it is. Only the transient rule records a turn that worked and failed again: every other rule's stop after a
+// him. A message whose turn worked and ended without an error ends the run, and so does one whose turn stopped
+// otherwise (another kind of error) and a message of another rule (its stop was another kind); a message that failed
+// again with no work is part of its episode, and leaves the count as it is. Only the transient rule records a turn that worked and failed again: every other rule's stop after a
 // message of its own is FailedAgain, which its tries bound already.
 func (h past) repeats(ownerAt time.Time) int {
 	n := 0
 	for _, s := range h.sends {
 		switch {
 		case !s.at.After(ownerAt):
-		case s.rule != RuleTransient || s.result[Worked]:
+		case s.rule != RuleTransient || s.result[Worked] || s.result[Otherwise]:
 			n = 0
 		case s.result[WorkedThenFailed]:
 			n++

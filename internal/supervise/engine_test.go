@@ -802,7 +802,7 @@ func TestATryThatWorkedThenFailedAgainStartsTheTriesOver(t *testing.T) {
 	sv := supervisor(st, f, &now)
 	s := erroring()
 	at := t0
-	for try := 0; try < 2; try++ { // fewer stops than the rule's tries: the stops bound (moves) stays out of it
+	for try := 0; try < 2; try++ { // fewer stops than the rule's waits: the stops bound (repeats) stays out of it
 		now = at.Add(DefaultParams.Backoff[0])
 		run(t, sv, s)
 		if len(f.sent) != try+1 {
@@ -892,6 +892,9 @@ func TestARuleThatKeepsMovingASessionToTheSameStopHoldsForItsOwner(t *testing.T)
 	cases := events(t, st, KindCase)
 	if len(f.sent) != len(DefaultParams.Backoff) || len(cases) != 1 || !strings.Contains(metaMap(cases[0])["why"].(string), reasonRepeat) {
 		t.Fatalf("sent %d over ten stops, cases %+v", len(f.sent), cases)
+	}
+	if n, ok := note(t, st, "supervise:"+s.Key); !ok || !strings.Contains(n.Title, "keeps stopping") {
+		t.Fatalf("the case's problem note: %+v (found %v)", n, ok)
 	}
 	// a turn of the session's own (a loop's run) that ends without an error leaves the note standing
 	s.TurnBegan, s.Since = now.Add(time.Minute), now.Add(2*time.Minute)
