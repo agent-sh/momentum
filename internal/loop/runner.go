@@ -168,6 +168,8 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	if len(o.Families) > 0 {
 		families = o.Families
 	}
+	// the tacit family is the weekly observation's, report-only: no pass ever builds it
+	families = slices.DeleteFunc(slices.Clone(families), func(f string) bool { return f == store.TacitFamily })
 	// the turns: a turn the store cannot read leaves its order as configured
 	turns := map[string]string{}
 	for _, kind := range []string{turnBuild, turnRun} {

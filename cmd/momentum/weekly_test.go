@@ -36,7 +36,7 @@ func weeklyFixture(t *testing.T) (*store.Store, weeklyDeps, *[]string) {
 	}
 	d.advise = func(_ context.Context, system, prompt, schema string) (json.RawMessage, string, float64, error) {
 		prompts = append(prompts, system, prompt)
-		return nil, "", 0, nil
+		return json.RawMessage(`{"recommendations":[],"handled":[]}`), "fixture-model", 0, nil
 	}
 	return st, d, &prompts
 }
@@ -134,6 +134,12 @@ func TestWeeklyKeepsTheReportAndTracksTacitChanges(t *testing.T) {
 func TestWeeklyShutdownLeavesANote(t *testing.T) {
 	ctx := context.Background()
 	st, d, _ := weeklyFixture(t)
+	for _, day := range []int{12, 19} { // a hook block in each scored week: a week with none is not scored
+		ts := time.Date(2030, 3, day, 9, 0, 0, 0, time.UTC)
+		line := `{"v":1,"id":"b` + ts.Format("02") + `","ts":"` + ts.Format(time.RFC3339) + `","hook":"prompt","session":"s1","cands":[]}` + "\n"
+		os.WriteFile(filepath.Join(d.deliveryDir, ts.Format("2006-01-02")+".jsonl"), []byte(line), 0o600)
+	}
+	os.WriteFile(filepath.Join(d.deliveryDir, "2030-03-01.jsonl"), nil, 0o600) // the log reaches back before the weeks
 	var out, errOut bytes.Buffer
 	d.now = func() time.Time { return time.Date(2030, 3, 9, 8, 0, 0, 0, time.UTC) } // the deployment, mid-week
 	if err := weekly(ctx, st, d, "", false, false, &out, &errOut); err != nil {
@@ -181,8 +187,27 @@ func TestTheLoopHonorsTheOffFileAndLeavesTacitCases(t *testing.T) {
 	}
 	os.Remove(filepath.Join(cfg, "off"))
 	os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(`{"loop":{"families":["failures"]}}`), 0o600)
-	if code, _, errOut := momentum("loop", "--dry", "--family", "tacit"); code != 2 || !strings.Contains(errOut, "report-only") {
+	if code, _, errOut := momentum("loop", "--dry", "--family", "failures, tacit"); code != 2 || !strings.Contains(errOut, "report-only") {
 		t.Fatalf("loop --family tacit: %d %s", code, errOut)
+	}
+}
+
+// A failed model pass still keeps the week's report and verdicts, and the run fails so its unit shows it.
+func TestAFailedModelPassFailsTheRunAfterTheReport(t *testing.T) {
+	st, d, _ := weeklyFixture(t)
+	d.advise = func(context.Context, string, string, string) (json.RawMessage, string, float64, error) {
+		return nil, "", 0, os.ErrDeadlineExceeded
+	}
+	var out, errOut bytes.Buffer
+	err := weekly(context.Background(), st, d, "", false, false, &out, &errOut)
+	if err == nil || !strings.Contains(err.Error(), "the model pass") {
+		t.Fatalf("run: %v", err)
+	}
+	if b, rerr := os.ReadFile(filepath.Join(weeklyDir(), "2030-W11.md")); rerr != nil || !strings.Contains(string(b), "No model pass:") {
+		t.Fatalf("report: %s %v", b, rerr)
+	}
+	if err := weekly(context.Background(), st, d, "2030-W09", false, false, &out, &errOut); err == nil || !strings.Contains(err.Error(), "only --dry") {
+		t.Fatalf("an older week judged: %v", err)
 	}
 }
 
@@ -195,7 +220,7 @@ func TestWeeklyInstallWritesAPersistentSundayTimer(t *testing.T) {
 	timer, _ := os.ReadFile(filepath.Join(dir, "momentum-weekly.timer"))
 	service, _ := os.ReadFile(filepath.Join(dir, "momentum-weekly.service"))
 	if !strings.Contains(string(timer), "OnCalendar=Sun *-*-* 08:00:00\n") || !strings.Contains(string(timer), "Persistent=true") ||
-		!strings.Contains(string(service), " weekly\n") || !strings.Contains(string(service), "Type=oneshot") {
+		!strings.Contains(string(service), " weekly\n") || !strings.Contains(string(service), "Wants=momentum-ingest.service") {
 		t.Fatalf("units:\n%s\n%s", timer, service)
 	}
 }

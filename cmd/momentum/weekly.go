@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/config"
@@ -71,13 +72,38 @@ func weeklyCmd(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if c.Loop.TacitStore == "" {
 		deps.tacitStore = filepath.Join(paths.Home(), ".local", "share", "tacit", "store")
 	}
-	st, err := store.Open(paths.DB())
+	open := store.OpenReadOnly // a dry run writes nothing, not even a migration
+	if !*dry {
+		unlock, err := weeklyLock(paths.DB())
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		open = store.Open
+	}
+	st, err := open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 	deps.advise = loopAdvisor(st, c.Loop)
 	return weekly(ctx, st, deps, *week, *dry, *asJSON, stdout, stderr)
+}
+
+// weeklyLock keeps one weekly run at a time: a second would stop the first's model pass and close its cases twice.
+func weeklyLock(db string) (func(), error) {
+	f, err := os.OpenFile(db+".weekly-lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, errors.New("another weekly run runs now")
+		}
+		return nil, err
+	}
+	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
 
 // loopAdvisor is the model pass on the loop's agent: its runner, model and fallback, its Bedrock route, within the
@@ -95,13 +121,19 @@ func loopAdvisor(st *store.Store, c config.Loop) advisor {
 		if err := onBedrock(agent); err != nil {
 			return nil, "", 0, err
 		}
-		week := selectionRunner(st, c).Budgets.Week
-		spent, err := st.LoopSpend(ctx, time.Now().Add(-7*24*time.Hour), 0)
-		if err != nil {
-			return nil, "", 0, err
-		}
-		if spent+loop.AdviceBudgetUSD > week {
-			return nil, "", 0, fmt.Errorf("the loop's week has $%.2f of its $%.2f left, under the pass's $%.2f", max(0, week-spent), week, loop.AdviceBudgetUSD)
+		b := selectionRunner(st, c).Budgets
+		for _, w := range []struct {
+			name   string
+			span   time.Duration
+			budget float64
+		}{{"day", 24 * time.Hour, b.Day}, {"week", 7 * 24 * time.Hour, b.Week}} {
+			spent, err := st.LoopSpend(ctx, time.Now().Add(-w.span), 0)
+			if err != nil {
+				return nil, "", 0, err
+			}
+			if spent+loop.AdviceBudgetUSD > w.budget {
+				return nil, "", 0, fmt.Errorf("the loop's %s has $%.2f of its $%.2f left, under the pass's $%.2f", w.name, max(0, w.budget-spent), w.budget, loop.AdviceBudgetUSD)
+			}
 		}
 		clean, err := loop.RedactAll(ctx, []string{system, prompt})
 		if err != nil {
@@ -128,6 +160,10 @@ func weekly(ctx context.Context, st *store.Store, d weeklyDeps, name string, dry
 		if w.End.After(now) {
 			return usageError{fmt.Sprintf("week %s has not ended", w.Name)}
 		}
+		if w.Name != scorecard.LastComplete(now).Name && !dry {
+			// an older week is judged on records that have aged out since: it is a report, never a verdict
+			return usageError{fmt.Sprintf("week %s is not the last complete week (%s): only --dry reports it", w.Name, scorecard.LastComplete(now).Name)}
+		}
 	}
 	o, err := scorecard.Observe(ctx, scorecard.Inputs{Store: st, DeliveryDir: d.deliveryDir, TacitStore: d.tacitStore}, w)
 	if err != nil {
@@ -138,13 +174,17 @@ func weekly(ctx context.Context, st *store.Store, d weeklyDeps, name string, dry
 		return err
 	}
 	var a scorecard.Advice
+	var failed []error // what went wrong after the verdicts: the run still keeps its report and notes, then fails
 	report := filepath.Join(weeklyDir(), w.Name+".md")
 	if dry {
 		a.None = "a dry run asks no model"
 	} else {
 		a = advise(ctx, st, d, o, sc)
+		if a.None != "" {
+			failed = append(failed, errors.New("the model pass: "+a.None))
+		}
 		if err := trackAdvice(ctx, st, &a, report); err != nil {
-			fmt.Fprintf(stderr, "momentum: the recommendations' cases: %v\n", err)
+			failed = append(failed, fmt.Errorf("the recommendations' cases: %w", err))
 		}
 	}
 	text := scorecard.Render(o, sc, a)
@@ -163,6 +203,11 @@ func weekly(ctx context.Context, st *store.Store, d weeklyDeps, name string, dry
 		}
 		return nil
 	}
+	for _, sd := range sc.Shutdowns { // first: a system turned off is said so before anything else can fail
+		if _, err := st.PutNote(ctx, shutdownNote(w, sc, sd, now)); err != nil {
+			return err
+		}
+	}
 	if err := os.MkdirAll(weeklyDir(), 0o700); err != nil {
 		return err
 	}
@@ -172,18 +217,13 @@ func weekly(ctx context.Context, st *store.Store, d weeklyDeps, name string, dry
 	if _, err := st.PutNote(ctx, weeklyNote(w, sc, a, now)); err != nil {
 		return err
 	}
-	for _, sd := range sc.Shutdowns {
-		if _, err := st.PutNote(ctx, shutdownNote(w, sc, sd, now)); err != nil {
-			return err
-		}
-	}
 	if !asJSON {
 		fmt.Fprintf(stdout, "%s: %s\n", w.Name, report)
 		for _, v := range sc.Verdicts {
 			fmt.Fprintf(stdout, "  %s: %s\n", v.System, v.Why)
 		}
 	}
-	return nil
+	return errors.Join(failed...)
 }
 
 // weeklyNote is the week's note in the report: decided, high, what each system came to and where the report is.
@@ -240,7 +280,7 @@ const adviceSchema = `{"type":"object","additionalProperties":false,"required":[
  "case":{"type":"string"},"why":{"type":"string"}}}}}}`
 
 // rulesFiles are the agent rules files no recommendation may promote facts into (the owner's constraint).
-var rulesFiles = regexp.MustCompile(`(?i)\b(agents|claude|shared)\.md\b`)
+var rulesFiles = regexp.MustCompile(`(?i)\b(agents|claude|shared|gemini|memory|rules|copilot-instructions)\.md\b|\.cursorrules|\brules files?\b|\bsystem prompt\b`)
 
 const adviceSystem = `You review one week of measurements of tacit, a memory system that delivers facts to coding agents through hooks (a block of fact lines at a session's start, at each prompt, before tool calls) and an MCP server (tacit_search, tacit_fact, tacit_tree, tacit_add, tacit_mark). Your answer is a short ranked list of concrete changes to tacit itself, its delivery, ranking, gates, curation, self-mark asks or judge, each tied to the numbers or the samples you were given, with the number it should move. Rank by expected effect on the scorecard: agents in interactive sessions marking delivered lines used at least as often as not relevant, and the owner having to restate what tacit already holds. Never propose promoting facts into AGENTS.md, CLAUDE.md, SHARED.md or any other agent rules file. Propose nothing you cannot tie to the evidence; fewer items are better than weak ones. For each open recommendation case you were given, list it under handled only when this week's numbers show the problem it named is gone, and say which numbers.`
 
@@ -276,7 +316,7 @@ func advise(ctx context.Context, st *store.Store, d weeklyDeps, o *scorecard.Obs
 		if r.Key == "" || strings.TrimSpace(r.Title) == "" {
 			continue
 		}
-		if rulesFiles.MatchString(r.Title + " " + r.Change + " " + r.Expected) {
+		if rulesFiles.MatchString(r.Title + " " + r.Change + " " + r.Evidence + " " + r.Expected) {
 			a.Dropped = append(a.Dropped, r.Title)
 			continue
 		}
@@ -425,12 +465,13 @@ func weeklyShow(args []string, stdout io.Writer) error {
 // model pass runs in a sandbox unit of its own.
 const weeklyService = `[Unit]
 Description=momentum: the weekly observation of tacit and momentum, and their scorecard
+Wants=momentum-ingest.service
 After=momentum-ingest.service
 
 [Service]
 Type=oneshot
 Environment=PATH=%%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=%s weekly
+%sExecStart=%s weekly
 Nice=10
 TimeoutStartSec=1h
 MemoryHigh=1536M
@@ -475,7 +516,14 @@ func weeklyInstall(args []string, stdout, stderr io.Writer) error {
 	if err := os.MkdirAll(*dir, 0o755); err != nil {
 		return err
 	}
-	for name, text := range map[string]string{"momentum-weekly.service": fmt.Sprintf(weeklyService, exe), "momentum-weekly.timer": weeklyTimer} {
+	// where tacit and momentum keep their records, as this shell has them: the user manager's environment may not
+	env := ""
+	for _, k := range []string{"TACIT_STATE_DIR", "TACIT_STORE", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "MOMENTUM_HOME", "MOMENTUM_CONFIG"} {
+		if v := os.Getenv(k); v != "" && !strings.ContainsAny(v, "\n\"%") {
+			env += fmt.Sprintf("Environment=\"%s=%s\"\n", k, v)
+		}
+	}
+	for name, text := range map[string]string{"momentum-weekly.service": fmt.Sprintf(weeklyService, env, exe), "momentum-weekly.timer": weeklyTimer} {
 		if err := os.WriteFile(filepath.Join(*dir, name), []byte(text), 0o644); err != nil {
 			return err
 		}

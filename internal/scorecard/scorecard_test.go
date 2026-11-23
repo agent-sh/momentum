@@ -206,6 +206,7 @@ func TestRestatementsMatchOlderCuratedFactsOnly(t *testing.T) {
 	writeFact(t, facts, "inbox/agent/walrus.md", fmt.Sprintf(factBody, "walrus-lanterns-flicker-hourly", "The walrus lanterns flicker hourly near the harbor gate", "2030-01-02", "walrus lanterns flicker", "x"))
 	writeFact(t, facts, "user/new.md", fmt.Sprintf(factBody, "pelican-ledger-closes-friday", "The pelican ledger closes every friday at noon sharp", "2030-03-13", "pelican ledger closes friday", "x"))
 	writeFact(t, facts, "user/mine.md", fmt.Sprintf(factBody, "otter-routers-need-reboots", "Otter routers need weekly reboots after firmware pushes", "2030-01-02", "otter routers need reboots", "claude:s-self"))
+	writeFact(t, facts, "user/old.md", "---\nname: heron-kiln-fires-at-dawn\ndescription: The heron kiln fires at dawn every single day\ncreated: \"2030-01-02\"\nretired: 2030-02-01\n---\n")
 	for i := 0; i < 20; i++ { // filler so the distinctive words stay rare
 		writeFact(t, facts, fmt.Sprintf("projects/p/f%d.md", i), fmt.Sprintf(factBody, fmt.Sprintf("filler-%d", i), fmt.Sprintf("generic filler item number %d about builds and disks", i), "2030-01-01", "", ""))
 	}
@@ -220,6 +221,7 @@ func TestRestatementsMatchOlderCuratedFactsOnly(t *testing.T) {
 		owner("s-self", "otter routers need weekly reboots after firmware pushes", at(3, 13)),
 		owner("s-x", "- zebra build cache on the quartz disk, never on tmpfs", at(3, 14)),
 		owner("s-x", "the zebra thing again", at(3, 15)),
+		owner("s-x", "the heron kiln fires at dawn every single day", at(3, 16)),
 		owner("s-old", "an older word", week.Prev(1).Start))
 	o, err := Observe(context.Background(), Inputs{Store: st, DeliveryDir: logDir, TacitStore: facts}, week)
 	if err != nil {
@@ -281,7 +283,11 @@ func (f *fakeSystemctl) run(_ context.Context, args ...string) ([]byte, error) {
 		var out []string
 		for _, pat := range args[4:] {
 			for _, u := range f.timers[pat] {
-				out = append(out, u+" enabled enabled")
+				state := "enabled"
+				if strings.HasPrefix(u, "off:") {
+					u, state = strings.TrimPrefix(u, "off:"), "disabled"
+				}
+				out = append(out, u+" "+state+" enabled")
 			}
 		}
 		return []byte(strings.Join(out, "\n")), nil
@@ -297,11 +303,12 @@ func TestTwoFailingScoredWeeksShutASystemDown(t *testing.T) {
 	st := testStore(t)
 	cfg := t.TempDir()
 	fs := &fakeSystemctl{timers: map[string][]string{"tacit-dream*.timer": {"tacit-dream.timer", "tacit-dream-idle.timer"},
-		"tacit-curate*.timer": {"tacit-curate.timer"}, "momentum-loop*.timer": {"momentum-loop.timer"}}}
+		"tacit-curate*.timer": {"tacit-curate.timer", "off:tacit-curate-extra.timer"}, "momentum-loop*.timer": {"momentum-loop.timer"}}}
 	sw := Switch{TacitOff: filepath.Join(cfg, "tacit", "off"), MomentumOff: filepath.Join(cfg, "momentum", "off"), Systemctl: fs.run}
 	w0 := week.Prev(1)
 	obs := func(w Week, improved int) *Observation {
-		return &Observation{Week: w, Momentum: MomentumWeek{Week: w.Name, Improved: improved}, Tacit: TacitWeek{Week: w.Name}}
+		return &Observation{Week: w, Momentum: MomentumWeek{Week: w.Name, Improved: improved},
+			Tacit: TacitWeek{Week: w.Name, ByHook: map[string]Count{"prompt": {Calls: 3}}}}
 	}
 	deploy := w0.Start.Add(time.Hour) // mid-week: that week is not scored
 	if sc, err := Score(ctx, st, sw, obs(w0, 0), true, deploy); err != nil || len(sc.Shutdowns) != 0 || sc.Verdicts[0].Scored {
@@ -343,6 +350,10 @@ func TestTwoFailingScoredWeeksShutASystemDown(t *testing.T) {
 	if err != nil || s.On || s.Shut != next.Name || s.Failing != 2 {
 		t.Fatalf("standing after the shutdown: %+v %v", s, err)
 	}
+	// the same week run again after the shutdown keeps its scored verdict
+	if sc, err := Score(ctx, st, sw, obs(next, 1), false, next.End.Add(9*time.Hour)); err != nil || !sc.Verdicts[0].Scored || sc.Verdicts[0].Delivers || len(sc.Shutdowns) != 0 {
+		t.Fatalf("a re-run of the shutdown week: %+v %v", sc, err)
+	}
 	// while it is off, a week is not scored and nothing is shut again
 	third := next.Next()
 	if sc, err := Score(ctx, st, sw, obs(third, 1), false, third.End.Add(8*time.Hour)); err != nil || len(sc.Shutdowns) != 0 || sc.Verdicts[0].Scored {
@@ -354,6 +365,30 @@ func TestTwoFailingScoredWeeksShutASystemDown(t *testing.T) {
 	sc, err = Score(ctx, st, sw, obs(fourth, 1), false, fourth.End.Add(8*time.Hour))
 	if err != nil || !slices.Equal(sc.Reenabled, []string{Tacit}) || sc.Verdicts[0].Scored || len(sc.Shutdowns) != 0 {
 		t.Fatalf("turned back on: %+v %v", sc, err)
+	}
+}
+
+// A week whose log holds no hook block, or does not reach its start, is no evidence: it is not scored, so a log that
+// is off or moved never shuts tacit down. tacit's default off-file counts as off too.
+func TestAWeekWithNoRecordsIsNotScored(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	cfg := t.TempDir()
+	sw := Switch{TacitOff: filepath.Join(cfg, "x", "tacit", "off"), TacitDefaultOff: filepath.Join(cfg, "home", "tacit", "off"),
+		MomentumOff: filepath.Join(cfg, "momentum", "off"), Systemctl: (&fakeSystemctl{}).run}
+	if _, err := Score(ctx, st, sw, &Observation{Week: week.Prev(1)}, false, week.Prev(1).Start.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for _, tw := range []TacitWeek{{Week: week.Name}, {Week: week.Name, Partial: true, ByHook: map[string]Count{"prompt": {Calls: 9}}}} {
+		sc, err := Score(ctx, st, sw, &Observation{Week: week, Tacit: tw}, true, week.End.Add(time.Hour))
+		if err != nil || sc.Verdicts[0].Scored || !strings.Contains(sc.Verdicts[0].Why, "holds no hook block") || !sc.Verdicts[1].Scored {
+			t.Fatalf("%+v: %+v %v", tw, sc.Verdicts, err)
+		}
+	}
+	os.MkdirAll(filepath.Dir(sw.TacitDefaultOff), 0o755)
+	os.WriteFile(sw.TacitDefaultOff, []byte("off\n"), 0o644)
+	if !sw.Off(Tacit) {
+		t.Fatal("tacit's default off-file does not read as off")
 	}
 }
 

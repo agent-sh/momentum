@@ -55,13 +55,14 @@ var timerPatterns = map[string][]string{
 // Switch turns the systems off.
 type Switch struct {
 	TacitOff, MomentumOff string
+	TacitDefaultOff       string // ~/.config/tacit/off, read as tacit reads it; empty: none
 	// Systemctl runs systemctl --user with the arguments and returns its output.
 	Systemctl func(ctx context.Context, args ...string) ([]byte, error)
 }
 
 // DefaultSwitch is the machine's: the systems' own off-files and the user manager.
 func DefaultSwitch() Switch {
-	return Switch{TacitOff: TacitOffFile(), MomentumOff: MomentumOffFile(), Systemctl: func(ctx context.Context, args ...string) ([]byte, error) {
+	return Switch{TacitOff: TacitOffFile(), MomentumOff: MomentumOffFile(), TacitDefaultOff: filepath.Join(paths.Home(), ".config", "tacit", "off"), Systemctl: func(ctx context.Context, args ...string) ([]byte, error) {
 		cctx, cancel := context.WithTimeout(ctx, time.Minute)
 		defer cancel()
 		return exec.CommandContext(cctx, "systemctl", append([]string{"--user"}, args...)...).CombinedOutput()
@@ -76,9 +77,13 @@ func (s Switch) OffFile(system string) string {
 	return s.MomentumOff
 }
 
-// Off says whether a system is off now.
+// Off says whether a system is off now. tacit is off by its own file, or by the default one (~/.config/tacit/off),
+// which tacit honors too whatever XDG_CONFIG_HOME says.
 func (s Switch) Off(system string) bool {
 	off, _ := isOff(s.OffFile(system))
+	if !off && system == Tacit && s.TacitDefaultOff != "" {
+		off, _ = isOff(s.TacitDefaultOff)
+	}
 	return off
 }
 
@@ -124,13 +129,18 @@ func (s Switch) Shut(ctx context.Context, system, week, why string, now time.Tim
 // units are the system's installed timers that a shutdown stops.
 func (s Switch) units(ctx context.Context, system string) ([]string, error) {
 	out, err := s.Systemctl(ctx, append([]string{"list-unit-files", "--no-legend", "--plain", "--type=timer"}, timerPatterns[system]...)...)
-	if err != nil && len(bytes.TrimSpace(out)) == 0 {
+	var exit *exec.ExitError
+	switch {
+	case err != nil && errors.As(err, &exit) && exit.ExitCode() == 1 && len(bytes.TrimSpace(out)) == 0:
 		return nil, nil // none matches: systemctl exits 1 on an empty list
+	case err != nil:
+		return nil, fmt.Errorf("%v %s", err, strings.TrimSpace(string(out)))
 	}
 	var units []string
 	for _, line := range strings.Split(string(out), "\n") {
+		// only the enabled ones: a timer the owner had turned off stays off when the system is turned back on
 		f := strings.Fields(line)
-		if len(f) > 0 && strings.HasSuffix(f[0], ".timer") && !slices.Contains(units, f[0]) {
+		if len(f) > 1 && strings.HasSuffix(f[0], ".timer") && f[1] == "enabled" && !slices.Contains(units, f[0]) {
 			units = append(units, f[0])
 		}
 	}

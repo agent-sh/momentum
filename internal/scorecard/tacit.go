@@ -245,6 +245,15 @@ type TacitWeek struct {
 	top, worst []string
 }
 
+// Blocks is how many hook blocks the week's log holds.
+func (t TacitWeek) Blocks() int {
+	n := 0
+	for _, c := range t.ByHook {
+		n += c.Calls
+	}
+	return n
+}
+
 // Classifier says what kind of session a session id is.
 type Classifier func(session string) string
 

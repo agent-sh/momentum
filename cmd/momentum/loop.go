@@ -179,7 +179,7 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if err != nil {
 		return err
 	}
-	if slices.Contains(c.Loop.Families, store.TacitFamily) || slices.Contains(strings.Split(*families, ","), store.TacitFamily) {
+	if slices.Contains(c.Loop.Families, store.TacitFamily) || slices.ContainsFunc(strings.Split(*families, ","), func(f string) bool { return strings.TrimSpace(f) == store.TacitFamily }) {
 		return usageError{"the tacit family is report-only: the weekly observation opens and closes its cases, and the loop never builds them"}
 	}
 	open := store.Open

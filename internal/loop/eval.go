@@ -116,7 +116,7 @@ func ParseGolden(raw []byte, path string) ([]GoldenTask, error) {
 		}
 		// a trial opens its case in the store as of the end, which holds only the families of cases: a task of any other
 		// would fail every trial of both arms
-		if !slices.Contains(store.Families, t.Family) {
+		if !slices.Contains(store.Families, t.Family) || t.Family == store.TacitFamily {
 			return nil, fmt.Errorf("%s:%d: %q is no family of cases (%s)", path, n, t.Family, strings.Join(store.Families, ", "))
 		}
 		seen[t.ID] = true

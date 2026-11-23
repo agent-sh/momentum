@@ -78,6 +78,7 @@ func Score(ctx context.Context, st *store.Store, sw Switch, o *Observation, dry 
 			}
 		}
 		v := Verdict{System: system, Week: o.Week.Name, Scored: s.On && scored(o.Week, s.Since)}
+		noRecords := system == Tacit && (o.Tacit.Partial || o.Tacit.Blocks() == 0)
 		var numbers any
 		if system == Tacit {
 			v.Delivers, v.Why = JudgeTacit(o.Tacit, o.TacitBefore)
@@ -88,12 +89,22 @@ func Score(ctx context.Context, st *store.Store, sw Switch, o *Observation, dry 
 		}
 		switch {
 		case !s.On:
+			v.Scored = false
 			v.Why = "not scored: " + system + " is off; " + v.Why
 		case !v.Scored:
 			v.Why = fmt.Sprintf("not scored: scoring starts with %s; %s", s.FirstScored, v.Why)
+		case noRecords:
+			// only real records count as a failing week: a log that is off, moved or cut is no evidence
+			v.Scored = false
+			v.Why = "not scored: tacit's delivery log holds no hook block of the whole week (none, or it starts after the week does); " + v.Why
 		}
 		row := store.ScorecardWeek{System: system, Week: o.Week.Name, Scored: v.Scored, Delivers: v.Delivers, Why: v.Why,
 			Numbers: numbersJSON(numbers), At: now}
+		kept := slices.IndexFunc(s.Weeks, func(w store.ScorecardWeek) bool { return w.Week == row.Week })
+		if kept >= 0 && !row.Scored {
+			row = s.Weeks[kept] // a scored verdict is never replaced by an unscored one (a re-run after a shutdown)
+			v.Scored, v.Delivers, v.Why = row.Scored, row.Delivers, row.Why+" (kept from "+row.At.Format("2006-01-02")+")"
+		}
 		weeks := slices.DeleteFunc(slices.Clone(s.Weeks), func(w store.ScorecardWeek) bool { return w.Week == row.Week })
 		weeks = append(weeks, row)
 		slices.SortFunc(weeks, func(a, b store.ScorecardWeek) int {
@@ -117,11 +128,12 @@ func Score(ctx context.Context, st *store.Store, sw Switch, o *Observation, dry 
 			if dry {
 				sc.Shutdowns = append(sc.Shutdowns, Shutdown{System: system, OffFile: sw.OffFile(system), Failed: []string{"dry: nothing was shut"}})
 			} else {
-				sd, err := sw.Shut(ctx, system, o.Week.Name, why, now)
-				if err != nil {
+				// the shutdown is recorded first: an off-file written without it would read as off by hand
+				if err := st.SetScorecardValue(ctx, keyShut(system), o.Week.Name, now); err != nil {
 					return sc, err
 				}
-				if err := st.SetScorecardValue(ctx, keyShut(system), o.Week.Name, now); err != nil {
+				sd, err := sw.Shut(ctx, system, o.Week.Name, why, now)
+				if err != nil {
 					return sc, err
 				}
 				sc.Shutdowns = append(sc.Shutdowns, sd)

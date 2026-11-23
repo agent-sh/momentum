@@ -88,7 +88,7 @@ func readFact(path string) (Fact, bool) {
 			continue
 		}
 		switch k {
-		case "name", "description", "created", "owner_words", "owner_words_from":
+		case "name", "description", "created", "owner_words", "owner_words_from", "session", "retired", "superseded_by":
 			if _, dup := fields[k]; dup {
 				continue
 			}
@@ -100,9 +100,9 @@ func readFact(path string) (Fact, bool) {
 			fields[k] = unquote(v)
 		}
 	}
-	f := Fact{Name: fields["name"], From: fields["owner_words_from"]}
-	if f.Name == "" {
-		return Fact{}, false
+	f := Fact{Name: fields["name"], From: strings.TrimSpace(fields["owner_words_from"] + " " + fields["session"])}
+	if r := strings.ToLower(fields["retired"]); f.Name == "" || r != "" && r != "false" && r != "no" || fields["superseded_by"] != "" {
+		return Fact{}, false // a fact tacit no longer holds is none the owner could restate
 	}
 	f.Text = strings.TrimSpace(fields["description"] + " " + fields["owner_words"])
 	if t, err := time.Parse("2006-01-02", firstN(fields["created"], 10)); err == nil {
