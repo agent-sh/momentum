@@ -1624,7 +1624,8 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 		return hand, nil
 	}
 	out = slices.Clone(hand)
-	had := map[string][3]map[string]bool{} // each package's imports at the base, by its directory: its landable code's, then every file's
+	had := map[string][3]map[string]bool{}
+	facts := map[string]pkgFacts{} // each package's imports at the base, by its directory: its landable code's, then every file's
 	for _, c := range changed {
 		if !selfLandable(c) || slices.Contains(out, c) {
 			continue
@@ -1652,7 +1653,7 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 		default:
 			dir := path.Dir(c)
 			if _, ok := had[dir]; !ok {
-				if had[dir], err = s.packageImports(ctx, p, base, dir); err != nil {
+				if had[dir], facts[dir], err = s.packageImports(ctx, p, base, dir); err != nil {
 					return nil, err
 				}
 			}
@@ -1663,7 +1664,9 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 			if strings.HasSuffix(c, "_test.go") {
 				imports = had[dir][1]
 			}
-			why = selfKept(c, old, now, imports, had[dir][2])
+			if why = selfKept(c, old, now, imports, had[dir][2]); why == "" {
+				why = pkgKept(c, old, now, facts[dir])
+			}
 		}
 		if why != "" {
 			out = append(out, c)
@@ -1683,12 +1686,13 @@ func (s *Ship) absent(ctx context.Context, p Package, rev, name string) (bool, e
 // packageImports are the imports of the Go files a directory holds at a revision: of the files the loop lands that are
 // no test files (what a file of its code may add), and of all of them (what a test file may add). A file a person
 // lands, or a test, may import what the loop's code may not.
-func (s *Ship) packageImports(ctx context.Context, p Package, rev, dir string) ([3]map[string]bool, error) {
+func (s *Ship) packageImports(ctx context.Context, p Package, rev, dir string) ([3]map[string]bool, pkgFacts, error) {
 	// names end with a NUL (-z): git quotes a name with a byte it does not print
 	list, err := s.git(ctx, p.Host, "ls-tree", "-z", "--name-only", rev, "--", dir+"/")
 	if err != nil {
-		return [3]map[string]bool{}, err
+		return [3]map[string]bool{}, pkgFacts{}, err
 	}
+	files := map[string][]byte{}
 	out := [3]map[string]bool{{}, {}, {}} // the landable code's imports, every file's, and the names the landable code selects
 	for _, name := range strings.Split(list, "\x00") {
 		if !strings.HasSuffix(name, ".go") {
@@ -1696,9 +1700,10 @@ func (s *Ship) packageImports(ctx context.Context, p Package, rev, dir string) (
 		}
 		b, plainFile, err := s.blob(ctx, p, rev, name)
 		if err != nil {
-			return out, err
+			return out, pkgFacts{}, err
 		}
 		if plainFile {
+			files[name] = b
 			code := selfLandable(name) && !strings.HasSuffix(name, "_test.go")
 			for _, i := range fileImports(b) {
 				out[1][i] = true
@@ -1713,7 +1718,7 @@ func (s *Ship) packageImports(ctx context.Context, p Package, rev, dir string) (
 			}
 		}
 	}
-	return out, nil
+	return out, readFacts(files), nil
 }
 
 // landPaths is the landing's check of a package's paths: the gate's, with the content of a change to the loop's own

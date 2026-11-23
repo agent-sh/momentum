@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -115,6 +116,47 @@ func TestOnlyALoopLandingsReviewIsToldItsTerms(t *testing.T) {
 	for name, p := range map[string]Package{"a hand landing": {Repo: SelfRepo, Hand: []string{"internal/x.go"}}, "another repository": {Repo: "agent-sh/other"}} {
 		if strings.Contains(reviewPrompt(c, p), "lands this change itself") {
 			t.Errorf("%s's review is told the loop lands it", name)
+		}
+	}
+}
+
+// A landable file reaches no further than its own code: it writes no variable of another package or of its package's
+// frame, and changes no function its package variables' initializers run at every start.
+func TestALandableFileWritesNoOtherPackagesState(t *testing.T) {
+	frame := "package detect\n\nvar Versions = map[string]string{\"failures\": \"v2\"}\n\nvar Replayable = []string{\"failures\"}\n"
+	init := "package detect\n\nimport \"strings\"\n\nvar shells = names()\n\nfunc names() []string { return strings.Fields(\"bash sh\") }\n\nfunc other() int { return 1 }\n"
+	facts := readFacts(map[string][]byte{"internal/detect/detect.go": []byte(frame), "internal/detect/failures.go": []byte(init)})
+	if !facts.frame["Versions"] || !facts.frame["Replayable"] || facts.frame["shells"] {
+		t.Fatalf("the frame: %v", facts.frame)
+	}
+	if _, ok := facts.initRun["names"]; !ok {
+		t.Fatalf("what initializers run: %v", facts.initRun)
+	}
+	base := "package detect\n\nimport \"github.com/agent-sh/momentum/internal/paths\"\n\nfunc keyed() string { return paths.DB() }\n"
+	for name, c := range map[string]struct{ file, old, now, why string }{
+		"a body of its own":              {"internal/detect/owner.go", base, base + "\nfunc more() int { x := map[string]int{}; x[\"a\"] = 1; return x[\"a\"] }\n", ""},
+		"another package's variable":     {"internal/detect/owner.go", base, base + "\nfunc set() { paths.Home = \"/x\" }\n", "another package"},
+		"another package's map":          {"internal/detect/owner.go", base, base + "\nfunc set() { delete(paths.Roots, \"a\") }\n", "another package"},
+		"its frame's map":                {"internal/detect/owner.go", base, base + "\nfunc set() { Versions[\"component-health\"] = \"v9\" }\n", "frame"},
+		"its frame's slice":              {"internal/detect/owner.go", base, base + "\nfunc set() { Replayable = append(Replayable, \"sessions\") }\n", "frame"},
+		"a function an initializer runs": {"internal/detect/failures.go", init, strings.Replace(init, "bash sh", "bash sh zsh", 1), "initializer runs"},
+		"another function of its own":    {"internal/detect/failures.go", init, strings.Replace(init, "return 1", "return 2", 1), ""},
+	} {
+		if why := pkgKept(c.file, []byte(c.old), []byte(c.now), facts); c.why == "" && why != "" || c.why != "" && !strings.Contains(why, c.why) {
+			t.Errorf("%s: why %q, want %q", name, why, c.why)
+		}
+	}
+	// the store's reads are its methods, by name: a name renamed away would let a write pass as one
+	for _, r := range storeReads {
+		_, onStore := reflect.TypeOf(&store.Store{}).MethodByName(r)
+		_, onRun := reflect.TypeOf(&store.Run{}).MethodByName(r)
+		if !onStore && !onRun {
+			t.Errorf("%s is no method of the store's", r)
+		}
+	}
+	for _, w := range []string{"CloseCase", "SweepCases", "Put", "SessionRun", "SaveStamps", "UpdateCase"} {
+		if !storeWrite(w) {
+			t.Errorf("%s may write and reads as a read", w)
 		}
 	}
 }
