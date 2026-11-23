@@ -228,6 +228,11 @@ func (r *Runner) Measure(ctx context.Context, o Options) ([]Measured, error) {
 			out = append(out, r.measureCase(ctx, c, o.Dry))
 		}
 	}
+	working, err := r.measureWorking(ctx, o)
+	out = append(out, working...)
+	if err != nil {
+		return out, err
+	}
 	closed, err := r.Store.Cases(ctx, store.CaseFilter{Statuses: []store.CaseStatus{store.CaseClosed}})
 	if err != nil {
 		return out, err
@@ -380,6 +385,11 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 				return failed(err.Error())
 			}
 			r.resolve(ctx, &p)
+		}
+	}
+	if c.Status == store.CaseDeployed && p.Check != nil && p.Check.Replay != nil {
+		if rekeyed, dropped := p.Check.Replay.Diff.Touches(c.Signatures); rekeyed+dropped > 0 {
+			return r.detectorFixed(ctx, c, &p, m, rekeyed, dropped, dry)
 		}
 	}
 	if c.Status == store.CaseDeployed || plan.Guard == nil && !p.OutOfEffect.IsZero() {

@@ -30,7 +30,7 @@ import (
 // ship and measure tools move it through deployed and measuring; it closes with a reason.
 func caseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError{"case needs detect, list, show, open, set, evidence, signature, close or reopen"}
+		return usageError{"case needs detect, list, show, open, set, evidence, signature, fixed, close or reopen"}
 	}
 	switch args[0] {
 	case "detect":
@@ -47,6 +47,8 @@ func caseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return caseEvidence(ctx, args[1:], stdout, stderr)
 	case "signature":
 		return caseSignature(ctx, args[1:], stdout, stderr)
+	case "fixed":
+		return caseFixed(ctx, args[1:], stdout, stderr)
 	case "close":
 		return caseClose(ctx, args[1:], stdout, stderr)
 	case "reopen":
@@ -654,6 +656,51 @@ func closeFixed(ctx context.Context, st *store.Store, id, fix, why string, stdou
 	if len(resumed) == 0 {
 		fmt.Fprintln(stdout, "no case was held by its stop")
 	}
+	return nil
+}
+
+// caseFixed records a fix made by hand on a case that is open, investigating or testing: what it is (--fix, a
+// reference) and when it went in (--at, default now). It closes nothing: the measure step measures the case's
+// recurrence over the week before the fix and the week after, and closes the case as improved only when its rate
+// measurably fell.
+func caseFixed(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	id, rest, err := idThenFlags("case fixed", args)
+	if err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("case fixed", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fix := fs.String("fix", "", "what fixed it: git:OWNER/REPO@SHA, file:PATH, or an address")
+	at := fs.String("at", "", "when the fix went in (default: now)")
+	if err := fs.Parse(rest); err != nil {
+		return usageError{err.Error()}
+	}
+	if fs.NArg() > 0 {
+		return usageError{fmt.Sprintf("case fixed takes one case's id, got %q too", fs.Arg(0))}
+	}
+	if *fix == "" {
+		return usageError{"case fixed needs --fix: the reference of what fixed it"}
+	}
+	when := time.Now()
+	if *at != "" {
+		if when, err = parseWhen(*at); err != nil {
+			return usageError{err.Error()}
+		}
+	}
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	recorded, err := st.RecordHandFix(ctx, id, *fix, when, store.HowNamed, caseActor())
+	if err != nil {
+		return caseErr(err)
+	}
+	if !recorded {
+		fmt.Fprintf(stdout, "%s: %s is on record already\n", id, *fix)
+		return nil
+	}
+	fmt.Fprintf(stdout, "%s: fixed by hand by %s at %s; the measure step measures it once the week after it has passed\n", id, *fix, when.Format(time.DateTime))
 	return nil
 }
 

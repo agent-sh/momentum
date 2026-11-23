@@ -135,7 +135,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		}
 		r.sweepRuns(ctx)
 		outs, swept, err := detect.Run(ctx, r.Store, r.Detectors, detect.Window{Since: r.now().Add(-detect.DefaultWindow), Until: r.now()},
-			"loop:detect", false)
+			DetectorActor, false)
 		if err != nil {
 			return nil, err
 		}

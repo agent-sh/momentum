@@ -92,10 +92,13 @@ const (
 	Insufficient CloseReason = "insufficient-evidence" // the evidence cannot decide it; also a case unseen past its retention
 	Solved       CloseReason = "already-solved"        // something else fixed it already
 	Duplicate    CloseReason = "duplicate"             // another case has the same root cause: it went into that one
+	// DetectorFix: its problem is no longer seen because momentum's own detector keys its events otherwise now, or no
+	// longer as failures: no measured improvement, only the measure tool closes so
+	DetectorFix CloseReason = "detector-fix"
 )
 
 // CloseReasons are the reasons a case can close with.
-var CloseReasons = []CloseReason{Improved, Guarded, NotWorthIt, Insufficient, Solved, Duplicate}
+var CloseReasons = []CloseReason{Improved, Guarded, NotWorthIt, Insufficient, Solved, Duplicate, DetectorFix}
 
 // CaseRetention is how long a case may go unseen before it closes by itself: about as long as Claude Code keeps a
 // transcript, past which the evidence behind it is gone from its source.
@@ -481,7 +484,20 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 			"and evidence that is no event does not (case reopen brings the case back by hand)", nil
 	}
 	from, since := c.Closed, "it closed as "+strings.ReplaceAll(string(c.Reason), "-", " ")
-	if c.Reason == Solved {
+	if c.Reason == Improved && c.Package == "" {
+		// a fix a person made, measured with no package of the loop's to watch: it comes back once the problem has
+		// happened again as often as the hours it counted before the fix
+		if fixes, err := handFixes(ctx, q, c); err != nil || len(fixes) == 0 {
+			return false, "a case closed as improved comes back at its old rate, which the measure step watches", err
+		}
+		after, err := count(from)
+		if err != nil {
+			return false, "", err
+		}
+		need := max(c.Measurement.Before, 1)
+		return after >= need, fmt.Sprintf("%d new since its fix by hand closed it as improved; it comes back at %d", after, need), nil
+	}
+	if c.Reason == Solved || c.Reason == DetectorFix {
 		_, at, named, err := fixedOf(ctx, q, c)
 		if err != nil {
 			return false, "", err
@@ -497,7 +513,7 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 	switch c.Reason {
 	case Improved:
 		return false, fmt.Sprintf("%d new since it closed as improved; the measure step brings it back at its old rate", after), nil
-	case Solved:
+	case Solved, DetectorFix:
 		return after > 0, fmt.Sprintf("%d new since %s", after, since), nil
 	case NotWorthIt, Insufficient:
 		need := max(c.ClosedEvidence, 1)
@@ -530,7 +546,7 @@ func reopenIfBack(ctx context.Context, q querier, c Case, added, actor string, n
 		return false, err
 	}
 	action := "reopened"
-	if c.Reason == Improved || c.Reason == Guarded || c.Reason == Solved {
+	if c.Reason == Improved || c.Reason == Guarded || c.Reason == Solved || c.Reason == DetectorFix {
 		action = "regressed"
 	}
 	return true, caseLog(ctx, q, c.ID, actor, action, fmt.Sprintf("%s; closed as %s; %s", added, c.Reason, why), now)
@@ -1043,7 +1059,7 @@ func (s *Store) ReopenCase(ctx context.Context, id string, evs []Evidence, why, 
 		return Case{}, err
 	}
 	action := "reopened"
-	if c.Reason == Improved || c.Reason == Guarded || c.Reason == Solved {
+	if c.Reason == Improved || c.Reason == Guarded || c.Reason == Solved || c.Reason == DetectorFix {
 		action = "regressed" // its fix did not hold
 	}
 	if err := caseLog(ctx, tx, c.ID, actor, action, fmt.Sprintf("closed as %s; %d new evidence: %s", c.Reason, added, why), now); err != nil {
@@ -1081,6 +1097,8 @@ func (s *Store) CloseCase(ctx context.Context, id string, reason CloseReason, in
 		return Case{}, badCase("only the measure tool closes a case as improved, with its measurement")
 	case reason == Guarded:
 		return Case{}, badCase("only the measure tool closes a case as guarded, with its watch")
+	case reason == DetectorFix:
+		return Case{}, badCase("only the measure tool closes a case as a detector fix, with what the detector keys its events as now")
 	case c.Status == CaseClosed && c.Family == HealthFamily && c.Reason == Solved && reason == Solved:
 		hint := ""
 		if _, _, named, err := fixedOf(ctx, tx, c); err != nil {

@@ -1327,3 +1327,34 @@ func TestTheCaseLogLabelsTheFixAFix(t *testing.T) {
 		t.Fatalf("the log line: %q", last)
 	}
 }
+
+// A case a fix by hand closed as improved has no package of the loop's to watch: it comes back once the evidence after
+// its close reaches the hours its measurement counted before the fix, and not on less.
+func TestACaseAFixByHandClosedComesBackAtItsOldCount(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	day := 24 * time.Hour
+	c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "h", Title: "t", Evidence: refsAt("a", 3, now.Add(-20*day))})
+	if _, err := st.UpdateCase(ctx, c.ID, CaseUpdate{Status: CaseTesting, Mechanism: ptr("m"), NextTest: ptr("n")}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	f := HandFix{Ref: "git:agent-sh/fake@abcdef1", At: now.Add(-14 * day)}
+	if _, err := st.RecordHandFix(ctx, c.ID, f.Ref, f.At, HowNamed, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CloseCase(ctx, c.ID, DetectorFix, "", "by hand", "test"); err == nil {
+		t.Fatal("a detector fix closed by hand")
+	}
+	got, err := st.CloseHandFixed(ctx, c.ID, f, 7*day, 3, 0, "3 of 50 active hours before, 0 of 50 after", "loop:measure")
+	if err != nil || got.Status != CaseClosed || got.Reason != Improved {
+		t.Fatalf("closed by its fix: %+v %v", got, err)
+	}
+	closedAt(t, st, c.ID, now.Add(-2*day))
+	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "h", Evidence: refsAt("b", 2, now.Add(-day))}); obs != KeptShut || got.Status != CaseClosed {
+		t.Fatalf("2 after a fix that counted 3 %s: %+v", obs, got)
+	}
+	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "h", Evidence: refsAt("c", 1, now.Add(-time.Hour))}); obs != Reopened || got.Status != CaseOpen {
+		t.Fatalf("3 after a fix that counted 3 %s: %+v", obs, got)
+	}
+}

@@ -89,6 +89,9 @@ const usage = `usage:
                                         an address; an event or a note takes its own time, kind and summary
   momentum case signature ID SIG        another signature (the root cause's: root:KEY); one another open case
                                         holds merges this case into that one (a closed one comes back first)
+  momentum case fixed ID --fix REF [--at WHEN]
+                                        a fix made by hand: the measure step closes the case as improved
+                                        only once its rate in the week after measurably fell
   momentum case close ID --reason R [--into ID] [--fix REF] --why W
                                         R is not-worth-it, insufficient-evidence, already-solved or duplicate;
                                         a component-health case closes as already-solved with --fix, what fixed
