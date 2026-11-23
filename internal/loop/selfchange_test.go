@@ -125,7 +125,11 @@ func TestOnlyALoopLandingsReviewIsToldItsTerms(t *testing.T) {
 func TestALandableFileWritesNoOtherPackagesState(t *testing.T) {
 	frame := "package detect\n\nvar Versions = map[string]string{\"failures\": \"v2\"}\n\nvar Replayable = []string{\"failures\"}\n"
 	init := "package detect\n\nimport \"strings\"\n\nvar shells = names()\n\nfunc names() []string { return strings.Fields(\"bash sh\") }\n\nfunc other() int { return 1 }\n"
-	facts := readFacts(map[string][]byte{"internal/detect/detect.go": []byte(frame), "internal/detect/failures.go": []byte(init)})
+	rules := "package detect\n\nvar ruleFuncs = map[string]func() int{\"a\": stored}\n\nfunc stored() int { return 1 }\n"
+	facts := readFacts(map[string][]byte{"internal/detect/detect.go": []byte(frame), "internal/detect/failures.go": []byte(init), "internal/detect/rules.go": []byte(rules)})
+	if _, ok := facts.initRun["stored"]; ok {
+		t.Fatal("a function only stored in a map counts as run at the start")
+	}
 	if !facts.frame["Versions"] || !facts.frame["Replayable"] || facts.frame["shells"] {
 		t.Fatalf("the frame: %v", facts.frame)
 	}
@@ -141,6 +145,8 @@ func TestALandableFileWritesNoOtherPackagesState(t *testing.T) {
 		"its frame's slice":              {"internal/detect/owner.go", base, base + "\nfunc set() { Replayable = append(Replayable, \"sessions\") }\n", "frame"},
 		"a function an initializer runs": {"internal/detect/failures.go", init, strings.Replace(init, "bash sh", "bash sh zsh", 1), "initializer runs"},
 		"another function of its own":    {"internal/detect/failures.go", init, strings.Replace(init, "return 1", "return 2", 1), ""},
+		"a local of its own":             {"internal/detect/owner.go", base, base + "\nfunc local() int { Versions := 1; return Versions }\n", ""},
+		"its frame copied into":          {"internal/detect/owner.go", base, base + "\nfunc set() { copy(Replayable, []string{\"sessions\"}) }\n", "frame"},
 	} {
 		if why := pkgKept(c.file, []byte(c.old), []byte(c.now), facts); c.why == "" && why != "" || c.why != "" && !strings.Contains(why, c.why) {
 			t.Errorf("%s: why %q, want %q", name, why, c.why)

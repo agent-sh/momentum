@@ -331,7 +331,7 @@ func selectors(f *ast.File) []string {
 var storeReads = strings.Fields(`Activity AgentEventBetween AgentParent APIErrors AskAnswered Before CallsOf CaseByID CaseEvidence
 	CaseLive CaseLog CaseLogBetween CaseLogCount CaseLogLimit Cases Children Close Counts Cursor DiskSamples EarlierResults EventByID
 	EventByKey Events EvidenceEvents FileCursors FileSeen FirstEvent FirstHarnessEvent FirstOf FirstPartyCalls Fixable FixedStop
-	GuardRecurred HandFixes HarnessReadPast HarnessReadThrough HarnessReadWindowThrough HasSession Incomplete KnownLoopRunDirs
+	HandFixes HarnessReadPast HarnessReadThrough HarnessReadWindowThrough HasSession Incomplete KnownLoopRunDirs
 	LastActionAt LoopRunByID LoopRuns LoopSpend LoopSpendMicros LoopTurn Marks Notes Origins OwnerSessions OwnerTurns
 	OwnerTurnsBetween PartialReadAfter Path PhasesSince QuietCases ReadThrough ReadWindowThrough RecentProcs ResumedAt RunTimes
 	SamplerStart ScorecardValue ScorecardWeeks SeenPaths SentTexts Seq SessionStamps Skipped Sources Stamps Stored SuperviseEvents
@@ -407,15 +407,29 @@ func readFacts(files map[string][]byte) pkgFacts {
 	return f
 }
 
-// calledNames are the plain names a node calls or refers to as a value (a function passed on is run later).
+// calledNames are the plain names a node calls, or passes to a call (which may run it): a function literal's body
+// counts only where the literal is called there, and a function only stored (in a map of rules) runs nothing.
 func calledNames(n ast.Node) []string {
 	var out []string
 	if n == nil {
 		return nil
 	}
 	ast.Inspect(n, func(x ast.Node) bool {
-		if id, ok := x.(*ast.Ident); ok {
-			out = append(out, id.Name)
+		switch x := x.(type) {
+		case *ast.FuncLit:
+			return false // stored, not run; a literal called in place is read from its call below
+		case *ast.CallExpr:
+			switch fn := x.Fun.(type) {
+			case *ast.Ident:
+				out = append(out, fn.Name)
+			case *ast.FuncLit:
+				out = append(out, calledNames(fn.Body)...)
+			}
+			for _, a := range x.Args {
+				if id, ok := a.(*ast.Ident); ok {
+					out = append(out, id.Name)
+				}
+			}
 		}
 		return true
 	})
@@ -428,7 +442,8 @@ func funcSource(fset *token.FileSet, src []byte, d *ast.FuncDecl) string {
 
 // pkgKept says why a change to a landable Go file reaches past its own code, against its package's facts, or "": it
 // assigns to, or takes the address of, a variable of another package or of its package's frame (a file a person
-// lands), or it changes or adds a function its package variables' initializers run, which runs at the start of every
+// lands), or it changes or adds a function its package variables' initializers call (within the package, by plain
+// name; methods and other packages' functions are the review's), which runs at the start of every
 // process that imports the package, the protected ones among them. What a body reaches otherwise (through a method,
 // reflect, a pointer it was given) is the review's.
 func pkgKept(name string, old, now []byte, facts pkgFacts) string {
@@ -524,13 +539,16 @@ func visitTargets(f *ast.File, fn func(ast.Expr)) {
 	ast.Inspect(f, func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.AssignStmt:
+			if n.Tok == token.DEFINE {
+				return true // a new name of its own
+			}
 			for _, l := range n.Lhs {
 				fn(l)
 			}
 		case *ast.IncDecStmt:
 			fn(n.X)
 		case *ast.CallExpr:
-			if id, ok := n.Fun.(*ast.Ident); ok && (id.Name == "delete" || id.Name == "clear") && len(n.Args) > 0 {
+			if id, ok := n.Fun.(*ast.Ident); ok && (id.Name == "delete" || id.Name == "clear" || id.Name == "copy") && len(n.Args) > 0 {
 				fn(n.Args[0])
 			}
 		case *ast.UnaryExpr:
