@@ -135,28 +135,6 @@ var DefaultParams = Params{
 // idle mostly never resumed without him, and its message only asks it to do the step it named.
 var Live = map[string]bool{RuleTransient: true, RuleAccess: true, RuleStalled: true, RulePromise: true}
 
-// RuleTries is how many messages a rule sends for one stop before a case: its tries, or for the transient rule
-// its waits. The same number bounds the stops a rule's messages may move a session through since its owner's last
-// turn (Supervisor.Run): a session that keeps stopping the same way after each message that moved it is one
-// problem, not a new one each time. The overdue rule counts its runs by job instead (overdueTries), so it has none.
-func RuleTries(rule string, p Params) int {
-	switch rule {
-	case RuleTransient:
-		return len(p.Backoff)
-	case RuleAccess:
-		return p.AccessTries
-	case RuleCutoff:
-		return p.CutoffTries
-	case RuleReopened:
-		return 1
-	case RuleStalled:
-		return p.StalledTries
-	case RulePromise:
-		return p.PromiseTries
-	}
-	return 0
-}
-
 // Decision is what supervision does about one session now.
 type Decision struct {
 	Rule     string

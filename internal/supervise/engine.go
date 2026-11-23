@@ -225,13 +225,13 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		tries := h.tries(ownerAt, reopened)
 		tries[RuleOverdue] = h.overdueTries(stop, ownerAt)
 		d := Decide(stop, tries, sv.Params, probe, now)
-		// A new episode after the rule's messages moved the session through as many stops as the rule has tries, with
-		// no owner turn between: the session keeps stopping the same way, and each message only starts the next
-		// stop. One case, and the rule holds until he comes back (reasonRepeat).
-		if d.Verdict == Act && tries[d.Rule] == 0 && d.Rule != RuleOverdue && !h.closed(d.Rule, ownerAt, reopened) {
-			if n, lim := h.moves(d.Rule, ownerAt), RuleTries(d.Rule, sv.Params); lim > 0 && n >= lim {
-				d.Verdict, d.Try = Case, n
-				d.Why = fmt.Sprintf("%s: it stopped the same way again after %d of the rule's messages moved it since its owner's last turn", reasonRepeat, n)
+		// A new transient stop after the rule's messages, in a row, each moved the session and met the same kind of
+		// error again, as many times as the rule has waits, with no owner turn between: each message only starts the
+		// next stop. One case, and the rule holds until he comes back (reasonRepeat).
+		if d.Rule == RuleTransient && d.Verdict == Act && tries[d.Rule] == 0 && !h.closed(d.Rule, ownerAt, reopened) {
+			if n := h.repeats(ownerAt); len(sv.Params.Backoff) > 0 && n >= len(sv.Params.Backoff) {
+				d.Verdict, d.Try = Case, 0
+				d.Why = fmt.Sprintf("%s: %d of its messages in a row each moved the session, which then stopped on a transient error again, since its owner's last turn", reasonRepeat, n)
 			}
 		}
 		shut := false // the rule would have acted, and a case of this stop keeps it from sending
@@ -246,7 +246,7 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		if d.Verdict == Skip && d.Rule == "" {
 			d.Rule = planRules(stop, Tries{}, sv.Params, probe).Rule // the rule a guard keeps from acting, if any
 		}
-		entry := &seenSession{s: s, stop: stop, presence: presence}
+		entry := &seenSession{s: s, stop: stop, presence: presence, ownerHold: h.heldForOwner(ownerAt)}
 		entry.ask, entry.asks = waitsOnOwner(s, stop, d, presence, sv.Params)
 		seen[s.Key] = entry
 		if d.Rule == "" {
@@ -657,6 +657,8 @@ func (sv *Supervisor) caseEvent(ctx context.Context, s *sessions.Session, stop S
 		title := fmt.Sprintf("momentum could not continue %s (%s)", sessionName(s), rule)
 		if going {
 			title = fmt.Sprintf("momentum keeps trying to continue %s (%s)", sessionName(s), rule)
+		} else if reason == reasonRepeat {
+			title = fmt.Sprintf("momentum stopped continuing %s (%s): it keeps stopping the same way", sessionName(s), rule)
 		}
 		detail := why + "."
 		if last := firstNonEmpty(stop.Error, Asked(stop.Words), stop.Words); last != "" {
@@ -741,8 +743,8 @@ const (
 	reasonPasted       = "pasted, not known to be submitted" // the paste may still sit on the line
 	reasonNoWay        = "no way to type into it"
 	reasonNotDelivered = "not delivered"
-	// reasonRepeat is a session that stopped the same way again after as many of a rule's messages moved it as the
-	// rule has tries, since its owner's last turn: no turn of the session's own lifts it, only his.
+	// reasonRepeat is a session the transient rule's messages kept moving on to another transient stop, as many in a
+	// row as the rule has waits, since its owner's last turn: no turn of the session's own lifts it, only his.
 	reasonRepeat = "keeps stopping"
 )
 
@@ -844,17 +846,36 @@ func (h past) tries(ownerAt time.Time, reopened map[string]time.Time) Tries {
 	return t
 }
 
-// moves counts the rule's messages since the owner's last turn whose turn did work (moved), however long ago: each
-// ended an episode, and tries starts the next one from zero, so only this count bounds how many stops in a row the
-// rule may carry a session through without him.
-func (h past) moves(rule string, ownerAt time.Time) int {
+// repeats counts the transient rule's messages in a row, since the owner's last turn, whose turn did work and then
+// met a transient error again (WorkedThenFailed): each such message ended its episode, and tries starts the next one
+// from zero, so only this count bounds how many such stops in a row the rule carries a session through without
+// him. A message whose turn worked and ended without an error ends the run, and so does a message of another rule
+// (its stop was another kind); a message that failed again with no work is part of its episode, and leaves the count
+// as it is. Only the transient rule records a turn that worked and failed again: every other rule's stop after a
+// message of its own is FailedAgain, which its tries bound already.
+func (h past) repeats(ownerAt time.Time) int {
 	n := 0
 	for _, s := range h.sends {
-		if s.rule == rule && s.at.After(ownerAt) && s.moved() {
+		switch {
+		case !s.at.After(ownerAt):
+		case s.rule != RuleTransient || s.result[Worked]:
+			n = 0
+		case s.result[WorkedThenFailed]:
 			n++
 		}
 	}
 	return n
+}
+
+// heldForOwner reports a case since the owner's last turn that holds a rule until he comes back because the session
+// kept stopping (reasonRepeat): its problem note stands until he does, whatever the session's own turns do.
+func (h past) heldForOwner(ownerAt time.Time) bool {
+	for _, c := range h.cases {
+		if c.reason == reasonRepeat && c.at.After(ownerAt) {
+			return true
+		}
+	}
+	return false
 }
 
 // overdueTries counts the overdue rule's resyncs for the stop's run: those for runs of the same job, or for the

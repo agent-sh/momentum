@@ -864,10 +864,10 @@ func TestTriesThatEachWorkThenFailAreSpacedByTheSecondWait(t *testing.T) {
 	}
 }
 
-// A session whose every message moves it on to the next stop of the same kind, with no owner turn between, gets as
-// many messages as the rule has tries, then one case, and the rule holds until its owner types: a turn of the
-// session's own does not lift that case. Before the bound, each message that worked started the tries over and a
-// session could get a message at every stop for hours.
+// A session whose every transient message moves it on and then into another transient error, with no owner turn
+// between, gets as many messages as the rule has waits, then one case, and the rule holds until its owner types: a
+// turn of the session's own lifts neither the case nor its note. Before the bound, each message that worked started
+// the tries over and a session could get a message at every stop for hours.
 func TestARuleThatKeepsMovingASessionToTheSameStopHoldsForItsOwner(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{}
@@ -893,9 +893,15 @@ func TestARuleThatKeepsMovingASessionToTheSameStopHoldsForItsOwner(t *testing.T)
 	if len(f.sent) != len(DefaultParams.Backoff) || len(cases) != 1 || !strings.Contains(metaMap(cases[0])["why"].(string), reasonRepeat) {
 		t.Fatalf("sent %d over ten stops, cases %+v", len(f.sent), cases)
 	}
-	if _, ok := note(t, st, "supervise:"+s.Key); !ok {
-		t.Fatal("the case left no problem note for the report")
+	// a turn of the session's own (a loop's run) that ends without an error leaves the note standing
+	s.TurnBegan, s.Since = now.Add(time.Minute), now.Add(2*time.Minute)
+	s.Phase, s.AskKind, s.Ask, s.LastText = sessions.Idle, "", "", "Done for now."
+	now = now.Add(3 * time.Minute)
+	run(t, sv, s)
+	if n, ok := note(t, st, "supervise:"+s.Key); !ok || !n.Done.IsZero() {
+		t.Fatalf("the case's problem note after the session's own turn: %+v (found %v)", n, ok)
 	}
+	s.Phase, s.AskKind, s.Ask, s.LastText = sessions.NeedsYou, sessions.AskError, "stopped on an error: "+err503, err503
 	// the owner types and the session stops the same way again: the rule sends again
 	typed(s, "keep going on the notes", now.Add(time.Minute))
 	if _, err := st.Put(context.Background(), []store.Event{{Source: store.Transcripts, SourceKey: StoreSession(s) + "@owner",
@@ -913,9 +919,46 @@ func TestARuleThatKeepsMovingASessionToTheSameStopHoldsForItsOwner(t *testing.T)
 	}
 }
 
-// The promise rule ships live, bounded as before: a message whose turn ends on another promise is that promise
+// A transient message whose turn worked and ended without an error ends the run of repeats: the stops after it count
+// from none, so a session that recovers in between is never held.
+func TestATurnThatWorkedCleanlyEndsTheRunOfRepeats(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	at := t0
+	for stop := 0; stop < 9; stop++ {
+		now = at.Add(DefaultParams.Backoff[0])
+		n := len(f.sent)
+		run(t, sv, s)
+		if len(f.sent) > n {
+			lands(s, strings.TrimPrefix(f.sent[n], "%7 "), now.Add(time.Second), true)
+			if stop%3 == 2 { // every third ends cleanly, and a run of the session's own meets the error later
+				s.Log.Add(sessions.Entry{Role: sessions.RoleAssistant, Text: "Notes written."})
+				s.Seq = s.Log.Seq()
+				s.Phase, s.AskKind, s.Ask, s.LastText = sessions.Idle, "", "", "Notes written."
+				s.Since = now.Add(time.Minute)
+				now = now.Add(2 * time.Minute)
+				run(t, sv, s)
+				s.Phase, s.AskKind, s.Ask, s.LastText = sessions.NeedsYou, sessions.AskError, "stopped on an error: "+err503, err503
+			}
+			s.Log.Add(sessions.Entry{Role: sessions.RoleAssistant, Text: err503})
+			s.Seq = s.Log.Seq()
+		}
+		at = now.Add(30 * time.Minute)
+		s.TurnBegan, s.Since = at.Add(-time.Minute), at
+		now = at.Add(time.Second)
+		run(t, sv, s)
+	}
+	if c := events(t, st, KindCase); len(f.sent) != 9 || len(c) != 0 {
+		t.Fatalf("sent %d over nine stops, cases %+v", len(f.sent), c)
+	}
+}
+
+// The promise rule ships live, bounded by its tries: a message whose turn ends on another promise is that promise
 // again, so two messages without an owner turn in between, then a case.
-func TestThePromiseRuleIsLiveAndBoundedAcrossStops(t *testing.T) {
+func TestThePromiseRuleIsLive(t *testing.T) {
 	if !Live[RulePromise] {
 		t.Fatal("the promise rule does not ship live")
 	}

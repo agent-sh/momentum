@@ -29,6 +29,9 @@ type seenSession struct {
 	presence time.Time
 	ask      ask
 	asks     bool
+	// ownerHold: a case holds its rule until the owner comes back (reasonRepeat), so its problem note stands until
+	// he does, whatever the session's own turns do
+	ownerHold bool
 }
 
 // ask is what a session waits on that only its owner can answer: the needs note's title is the question itself, or
@@ -175,7 +178,7 @@ func (sv *Supervisor) notes(ctx context.Context, seen map[string]*seenSession) e
 			// wait on a model request, or on a retry's backoff after an error), or one that stopped since without an
 			// error
 			stuck := ok && e.s.Tool == "claude" && e.s.Now == ""
-			again := ok && (e.s.TurnOpen && !stuck || e.stop.At.After(n.At) && e.stop.Error == "")
+			again := ok && !e.ownerHold && (e.s.TurnOpen && !stuck || e.stop.At.After(n.At) && e.stop.Error == "")
 			if !ok || e.presence.After(n.At) || again {
 				if err := done(n.ID); err != nil {
 					return err
