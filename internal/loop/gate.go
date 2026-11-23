@@ -239,7 +239,6 @@ var selfLand = []string{
 	"internal/request/",          // the owner's requests and their follow-ups
 	"sessions/",                  // the live session layer's readers
 	"internal/capacity/rules.go", // the capacity rules a capacity run applies
-	"cmd/momentum/report.go", "cmd/momentum/note.go", "cmd/momentum/output.go", "cmd/momentum/request.go", "cmd/momentum/sessions.go",
 	"README.md",
 }
 
@@ -368,7 +367,7 @@ func SelfHand() []string { return slices.Clone(selfHand) }
 // the sandbox, the run's read-only reader, the check CI builds from the tree, its configuration and its paths; the
 // store, whose schema and migrations hold every event and case and whose case store decides which close a case may
 // take; the weekly scorecard that judges momentum and tacit, and internal/weekly/ reserved beside it; the capacity run's events and read records and the busy check the
-// repository gate uses; every command but the few that only print (selfLand), since the commands hold the gates,
+// repository gate uses; every command, since the commands' package holds the gates,
 // the kill switches (supervise.off, loop.live) and the measure and ship steps; and its build and supply chain (go.mod,
 // go.sum, go.work, go.work.sum, vendor/). CI configuration is refused in every repository besides (ciPaths). A
 // path is compared without case: a checkout on a case-insensitive disk writes Internal/loop/x.go into internal/loop/.
@@ -381,7 +380,7 @@ func ProposalProtected() []string {
 }
 
 // proposalProtected says whether a path of momentum's own repository is in ProposalProtected, and not one the loop
-// lands (the commands that only print).
+// lands.
 func proposalProtected(c string) bool {
 	if selfLandable(c) {
 		return false

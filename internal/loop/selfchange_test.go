@@ -22,7 +22,7 @@ func TestTheLoopLandsAllButWhatItsJudgmentRestsOn(t *testing.T) {
 	for _, c := range []string{"internal/detect/failures.go", "internal/detect/failures_test.go", "internal/detect/new.go", "internal/supervise/engine.go",
 		"internal/supervise/rules_test.go", "internal/supervise/zz_loop_test.go", "internal/evidenceview/view.go", "internal/request/state.go",
 		"sessions/claude/scan.go", "sessions/new/file.go", "internal/capacity/rules.go", "internal/capacity/rules_test.go",
-		"cmd/momentum/report.go", "cmd/momentum/report_test.go", "README.md"} {
+		"README.md"} {
 		if !selfLandable(c) || proposalProtected(c) {
 			t.Errorf("%s: landable %v, protected %v", c, selfLandable(c), proposalProtected(c))
 		}
@@ -37,7 +37,7 @@ func TestTheLoopLandsAllButWhatItsJudgmentRestsOn(t *testing.T) {
 	for _, c := range []string{"internal/loop/gate.go", "internal/measure/rekey/rekey.go", "internal/measure/rekey/replay/main.go", "internal/sandbox/x.go",
 		"internal/ro/ro.go", "internal/tracked/check/main.go", "internal/config/config.go", "internal/paths/paths.go", "internal/store/store.go",
 		"internal/scorecard/score.go", "internal/weekly/week.go", "internal/capacity/acts.go", "internal/capacity/run.go", "cmd/momentum/loop.go",
-		"cmd/momentum/supervise.go", "cmd/momentum/new.go", "cmd/momentum/report_extra_test.go", "go.mod", "go.sum", "vendor/x/y.go", "Internal/Loop/gate.go"} {
+		"cmd/momentum/supervise.go", "cmd/momentum/report.go", "cmd/momentum/new.go", "cmd/momentum/report_extra_test.go", "go.mod", "go.sum", "vendor/x/y.go", "Internal/Loop/gate.go"} {
 		if selfLandable(c) || !proposalProtected(c) {
 			t.Errorf("%s is what the loop's judgment or authority rests on: landable %v, protected %v", c, selfLandable(c), proposalProtected(c))
 		}
@@ -62,6 +62,7 @@ func TestALandableFilesChangeKeepsItsPackageAndItsTests(t *testing.T) {
 		"an initializer":                 {rulesPath, selfRules, two + "\nfunc init() { limit = 3 }\n", had, ""},
 		"a standard import":              {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os\"\n)", 1) + "\nvar _ = os.Args\n", had, ""},
 		"a module import":                {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"github.com/agent-sh/momentum/internal/plain\"\n)", 1), had, ""},
+		"a protected package's import":   {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"github.com/agent-sh/momentum/internal/config\"\n)", 1), had, "never changes"},
 		"a risky import":                 {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os/exec\"\n)", 1), had, "os/exec"},
 		"the network":                    {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"net/http\"\n)", 1), had, "net/http"},
 		"a risky import its package has": {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os/exec\"\n)", 1), map[string]bool{"os/exec": true}, ""},

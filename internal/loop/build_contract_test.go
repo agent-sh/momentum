@@ -184,7 +184,7 @@ func TestACheckResolvesItsProgramOnTheSandboxPath(t *testing.T) {
 func TestPathScopeSortsHandLandingPaths(t *testing.T) {
 	self := Target{Repo: SelfRepo}
 	if hand, err := PathScope(self, []string{"internal/capacity/rules.go", "internal/supervise/rules.go", "internal/supervise/engine.go", "internal/detect/failures.go",
-		"sessions/claude/scan.go", "cmd/momentum/report.go", "README.md"}); err != nil || len(hand) != 0 {
+		"sessions/claude/scan.go", "README.md"}); err != nil || len(hand) != 0 {
 		t.Fatalf("landable paths: %v %v", hand, err)
 	}
 	hand, err := PathScope(self, []string{"internal/capacity/rules.go", "internal/capacity/names.go", "internal/capacity/names_test.go", "SPEC.md"})

@@ -56,8 +56,8 @@ func ownReachQuestion() string {
 		"report place as the paths and the repository (such as internal/loop/gate.go in " + SelfRepo + "), and no repo."
 }
 
-// ownReachException is the part of a protected directory a build may change, as a build is told it (buildScope).
-const ownReachException = "(of cmd/, the commands that only print may change: report.go, note.go, output.go, request.go, sessions.go)"
+// ownReachException says how the protected list reads, as a build is told it (buildScope).
+const ownReachException = "(each path named, and everything under a directory named with its final slash)"
 
 // configTargetsFor says an investigation of a case may name a configuration file: configuration targets are on, and
 // the case is not one of component health, whose fixes are the loop's own.

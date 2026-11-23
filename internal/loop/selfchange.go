@@ -47,8 +47,8 @@ func std(path string) bool {
 // the file the change leaves (nil when it deletes it), and had the imports of the package's files at the base. The
 // change keeps the package within what it could do and keeps the checks its tests make:
 //   - it parses, and adds no comment the toolchain reads (a directive, a build constraint);
-//   - every import it adds is of the loop's own module, or of the standard library but riskyImports, unless its
-//     package already imports it;
+//   - every import it adds is of the loop's own module but the packages no change touches (ProposalProtected), or of
+//     the standard library but riskyImports, unless its package already imports it;
 //   - in a test file, it takes away no test function the file held (deleting the file takes them all), and adds no
 //     TestMain (it decides what runs) and no call of Skip, SkipNow or Skipf (a test that skips proves nothing).
 //
@@ -96,7 +96,12 @@ func selfKept(name string, old, now []byte, had map[string]bool) string {
 		if before[path] || had[path] {
 			continue
 		}
-		if !(path == modulePath || strings.HasPrefix(path, modulePath+"/") || std(path) && !risky(path)) {
+		own := path == modulePath || strings.HasPrefix(path, modulePath+"/")
+		if own && proposalProtected(strings.TrimPrefix(path, modulePath+"/")+"/") {
+			// what the loop's judgment rests on, which a package that did not import it could reach to change
+			return "it adds an import of a package the loop never changes: " + path
+		}
+		if !(own || std(path) && !risky(path)) {
 			return "it adds an import its package does not have: " + path
 		}
 	}
