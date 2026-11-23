@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -215,7 +216,7 @@ func (r *Runner) detectorFix(ctx context.Context, c store.Case, span keyedSpan) 
 			dropped++
 		}
 	}
-	if held < detect.FailuresRecur.Events {
+	if held < detectorFixFloor {
 		return false, "", nil // fewer than a finding holds: too little to say the detector keys the problem otherwise
 	}
 	counts := []rekey.Count{}
@@ -234,6 +235,10 @@ func (r *Runner) detectorFix(ctx context.Context, c store.Case, span keyedSpan) 
 	}
 	return true, "momentum's own detector no longer keys its problem as this case does (" + strings.Join(parts, "; ") + "): not measured as an improvement", nil
 }
+
+// detectorFixFloor is the least evidence of the week a detector fix needs: the three events a failures finding holds
+// at least, kept here so no detector change moves it.
+const detectorFixFloor = 3
 
 // DetectorActor is who the loop's detectors file their findings as: the pass's detect step.
 const DetectorActor = "loop:detect"
@@ -345,7 +350,8 @@ func (r *Runner) handFixed(ctx context.Context, c store.Case, f store.HandFix, f
 		return record(fmt.Sprintf("the fix by hand (%s) is not measured: the four weeks before it hold %d hours of the problem, fewer than the %d a measurement needs", f.Ref, b.Hits, measure.MinBefore))
 	}
 	res, compared := measure.Compare(b, a)
-	// each fix of an episode is another chance to pass by luck: the n-th is held to the test's level divided by n
+	// each fix of an episode is another chance to pass by luck: the n-th is held to alpha * 6/(pi^2 n^2), a sequence that
+	// sums to alpha over every fix an episode can have
 	n := 1
 	for _, g := range fixes {
 		if g.Measured || g.Ref == f.Ref {
@@ -353,9 +359,12 @@ func (r *Runner) handFixed(ctx context.Context, c store.Case, f store.HandFix, f
 		}
 	}
 	n--
-	if compared && res.Improved && res.P >= measure.Alpha/float64(n) {
+	level := measure.Alpha * 6 / (math.Pi * math.Pi * float64(n*n))
+	if compared && res.Improved && res.P >= level {
 		res.Improved = false
-		res.Effect += fmt.Sprintf(" (fix %d of its episode, held to p below %.3f)", n, measure.Alpha/float64(n))
+	}
+	if compared {
+		res.Effect += fmt.Sprintf(" (fix %d of its episode, held to p below %.4f)", n, level)
 	}
 	if compared {
 		m.Result = &res

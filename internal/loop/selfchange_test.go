@@ -19,7 +19,7 @@ const (
 // the parts of those directories a replay over the store cannot read, the part that types into a session, and what
 // the store builds on stay a person's, compared without case.
 func TestTheLoopLandsAllButWhatItsJudgmentRestsOn(t *testing.T) {
-	for _, c := range []string{"internal/detect/failures.go", "internal/detect/failures_test.go", "internal/detect/new.go", "internal/supervise/engine.go",
+	for _, c := range []string{"internal/detect/failures.go", "internal/detect/failures_test.go", "internal/detect/owner.go", "internal/detect/new.go", "internal/supervise/engine.go",
 		"internal/supervise/rules_test.go", "internal/supervise/zz_loop_test.go", "internal/request/state.go",
 		"sessions/claude/scan.go", "sessions/new/file.go", "internal/capacity/rules.go", "internal/capacity/rules_test.go",
 		"README.md"} {
@@ -27,7 +27,7 @@ func TestTheLoopLandsAllButWhatItsJudgmentRestsOn(t *testing.T) {
 			t.Errorf("%s: landable %v, protected %v", c, selfLandable(c), proposalProtected(c))
 		}
 	}
-	for _, c := range []string{"internal/detect/sessions.go", "internal/detect/sessions_test.go", "internal/supervise/replay.go", "internal/supervise/history.go",
+	for _, c := range []string{"internal/detect/sessions.go", "internal/detect/sessions_test.go", "internal/detect/detect.go", "internal/detect/keyed.go", "sessions/proc/x.go", "sessions/internal/text/x.go", "internal/supervise/replay.go", "internal/supervise/history.go",
 		"sessions/act/act.go", "sessions/Act/x.go", "internal/detect/Sessions.go", "sessions/state/state.go", "sessions/sessions.go", "internal/evidenceview/view.go", "internal/source/transcripts.go", "internal/toolresult/x.go", "internal/plain/plain.go", "internal/capacity/names.go",
 		"SPEC.md", "AGENTS.md", "LICENSE", "Internal/detect/failures.go"} {
 		if selfLandable(c) || proposalProtected(c) {
@@ -58,35 +58,38 @@ func TestALandableFilesChangeKeepsItsPackageAndItsTests(t *testing.T) {
 		had      map[string]bool
 		why      string
 	}{
-		"a rule's change":                {rulesPath, selfRules, two, had, ""},
-		"an initializer":                 {rulesPath, selfRules, two + "\nfunc init() { limit = 3 }\n", had, "initializer"},
-		"a variable that runs code":      {rulesPath, selfRules, two + "\nvar started = fmt.Sprint(1)\n", had, "runs code"},
-		"a constant":                     {rulesPath, selfRules, two + "\nconst grace = 2\n", had, ""},
-		"a standard import":              {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os\"\n)", 1) + "\nvar _ = os.Args\n", had, ""},
-		"a module import":                {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"github.com/agent-sh/momentum/internal/plain\"\n)", 1), had, ""},
-		"a protected package's import":   {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"github.com/agent-sh/momentum/internal/config\"\n)", 1), had, "never changes"},
-		"a risky import":                 {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os/exec\"\n)", 1), had, "os/exec"},
-		"the network":                    {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"net/http\"\n)", 1), had, "net/http"},
-		"a risky import its package has": {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os/exec\"\n)", 1), map[string]bool{"os/exec": true}, ""},
-		"another module":                 {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import \"golang.org/x/sys/unix\"", 1), had, "golang.org/x/sys/unix"},
-		"a build constraint":             {rulesPath, selfRules, "//go:build never\n\n" + selfRules, had, "toolchain"},
-		"a linked name":                  {rulesPath, selfRules, selfRules + "\n//go:linkname name runtime.x\n", had, "toolchain"},
-		"a file that does not parse":     {rulesPath, selfRules, selfRules + "func {\n", had, "does not parse"},
-		"a new file":                     {"internal/supervise/new.go", "", "package supervise\n\nfunc New() int { return 1 }\n", had, ""},
-		"a file deleted":                 {rulesPath, selfRules, "", had, ""},
-		"a test appended":                {rulesTestPath, selfRulesTest, selfRulesTest + selfNewTest, had, ""},
-		"a test's body rewritten":        {rulesTestPath, selfRulesTest, strings.Replace(selfRulesTest, "<= 0", "< 0", 1), had, ""},
-		"a test taken away":              {rulesTestPath, selfRulesTest + selfNewTest, selfRulesTest, had, "TestLimitIsTwo"},
-		"a test renamed":                 {rulesTestPath, selfRulesTest, strings.Replace(selfRulesTest, "TestLimitIsPositive", "TestLimitIsAbove", 1), had, "TestLimitIsPositive"},
-		"a skip put inside an old test":  {rulesTestPath, selfRulesTest, strings.Replace(selfRulesTest, "\tif Limit", "\tt.Skip()\n\tif Limit", 1), had, "Skip"},
-		"a TestMain":                     {rulesTestPath, selfRulesTest, selfRulesTest + "\nfunc TestMain(m *testing.M) {}\n", had, "TestMain"},
-		"a test file deleted":            {rulesTestPath, selfRulesTest, "", had, "deletes a test file"},
-		"a new test file":                {"internal/supervise/new_test.go", "", selfRulesTest, had, ""},
-		"a test's data":                  {"internal/detect/testdata/x.txt", "a", "b", had, ""},
-		"a script":                       {"internal/detect/fix.sh", "a", "b", had, "no Go file"},
-		"a test of one platform":         {"internal/supervise/x_arm64_test.go", "a", "b", had, "one platform"},
-		"a file of one platform":         {"internal/supervise/x_linux.go", "a", "b", had, "one platform"},
-		"an assembly file":               {"internal/supervise/sys_amd64.s", "a", "b", had, "no Go file"},
+		"a rule's change":                  {rulesPath, selfRules, two, had, ""},
+		"an initializer":                   {rulesPath, selfRules, two + "\nfunc init() { limit = 3 }\n", had, "initializer"},
+		"a variable that runs code":        {rulesPath, selfRules, two + "\nvar started = fmt.Sprint(1)\n", had, "runs code"},
+		"a value that runs code rewritten": {rulesPath, selfRules + "\nvar started = fmt.Sprint(1)\n", two + "\nvar started = fmt.Sprint(2)\n", had, "rewrites"},
+		"a store write called":             {rulesPath, selfRules, two + "\nfunc closeAll(st interface{ CloseCase() }) { st.CloseCase() }\n", had, "store method"},
+		"a store read called":              {rulesPath, selfRules, two + "\nfunc read(st interface{ Events() }) { st.Events() }\n", had, ""},
+		"a constant":                       {rulesPath, selfRules, two + "\nconst grace = 2\n", had, ""},
+		"a standard import":                {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os\"\n)", 1) + "\nvar _ = os.Args\n", had, ""},
+		"a module import":                  {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"github.com/agent-sh/momentum/internal/plain\"\n)", 1), had, ""},
+		"a protected package's import":     {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"github.com/agent-sh/momentum/internal/config\"\n)", 1), had, "never changes"},
+		"a risky import":                   {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os/exec\"\n)", 1), had, "os/exec"},
+		"the network":                      {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"net/http\"\n)", 1), had, "net/http"},
+		"a risky import its package has":   {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os/exec\"\n)", 1), map[string]bool{"os/exec": true}, ""},
+		"another module":                   {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import \"golang.org/x/sys/unix\"", 1), had, "golang.org/x/sys/unix"},
+		"a build constraint":               {rulesPath, selfRules, "//go:build never\n\n" + selfRules, had, "toolchain"},
+		"a linked name":                    {rulesPath, selfRules, selfRules + "\n//go:linkname name runtime.x\n", had, "toolchain"},
+		"a file that does not parse":       {rulesPath, selfRules, selfRules + "func {\n", had, "does not parse"},
+		"a new file":                       {"internal/supervise/new.go", "", "package supervise\n\nfunc New() int { return 1 }\n", had, ""},
+		"a file deleted":                   {rulesPath, selfRules, "", had, ""},
+		"a test appended":                  {rulesTestPath, selfRulesTest, selfRulesTest + selfNewTest, had, ""},
+		"a test's body rewritten":          {rulesTestPath, selfRulesTest, strings.Replace(selfRulesTest, "<= 0", "< 0", 1), had, ""},
+		"a test taken away":                {rulesTestPath, selfRulesTest + selfNewTest, selfRulesTest, had, "TestLimitIsTwo"},
+		"a test renamed":                   {rulesTestPath, selfRulesTest, strings.Replace(selfRulesTest, "TestLimitIsPositive", "TestLimitIsAbove", 1), had, "TestLimitIsPositive"},
+		"a skip put inside an old test":    {rulesTestPath, selfRulesTest, strings.Replace(selfRulesTest, "\tif Limit", "\tt.Skip()\n\tif Limit", 1), had, "Skip"},
+		"a TestMain":                       {rulesTestPath, selfRulesTest, selfRulesTest + "\nfunc TestMain(m *testing.M) {}\n", had, "TestMain"},
+		"a test file deleted":              {rulesTestPath, selfRulesTest, "", had, "deletes a test file"},
+		"a new test file":                  {"internal/supervise/new_test.go", "", selfRulesTest, had, ""},
+		"a test's data":                    {"internal/detect/testdata/x.txt", "a", "b", had, ""},
+		"a script":                         {"internal/detect/fix.sh", "a", "b", had, "no Go file"},
+		"a test of one platform":           {"internal/supervise/x_arm64_test.go", "a", "b", had, "one platform"},
+		"a file of one platform":           {"internal/supervise/x_linux.go", "a", "b", had, "one platform"},
+		"an assembly file":                 {"internal/supervise/sys_amd64.s", "a", "b", had, "no Go file"},
 	} {
 		var old, now []byte
 		if c.old != "" {

@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"context"
 	"flag"
+	"math"
 	"fmt"
 	"os"
 	"strings"
@@ -45,7 +46,8 @@ func run(storePath, since, until, out string) error {
 		return err
 	}
 	defer st.Close()
-	// what the detectors' runs file, after every threshold and filter of theirs: the evidence of each finding
+	// what the detectors' runs file, after every threshold and filter of theirs: the evidence of each finding, all of it
+	detect.MaxEvidence = math.MaxInt
 	var lines []rekey.Line
 	for _, d := range []detect.Detector{detect.Failures{}, detect.OwnerBurden{}} {
 		fs, err := d.Detect(context.Background(), st, detect.Window{Since: from, Until: to})

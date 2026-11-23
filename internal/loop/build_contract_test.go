@@ -74,7 +74,7 @@ func TestTheBuildBriefShowsTheTestCommandContract(t *testing.T) {
 // terms it lands them on, that a fix elsewhere is proposed for a hand landing, and what no change touches.
 func TestABuildIsToldItsPathsUpFront(t *testing.T) {
 	self := buildScope(SelfRepo)
-	for _, want := range []string{"internal/supervise/", "internal/capacity/rules.go", "internal/detect/", "but not internal/detect/sessions.go", "replayed over",
+	for _, want := range []string{"internal/supervise/", "internal/capacity/rules.go", "internal/detect/", "internal/detect/sessions.go", "replayed over",
 		"land by hand", "internal/loop/", "internal/tracked/", "internal/store/", "internal/scorecard/", ".github/"} {
 		if !strings.Contains(self, want) {
 			t.Fatalf("the loop's own scope lacks %q: %s", want, self)

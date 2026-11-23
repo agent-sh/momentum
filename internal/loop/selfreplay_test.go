@@ -66,7 +66,7 @@ func replayFixture(t *testing.T) (*Ship, store.Case, Package) {
 	t.Helper()
 	st := testStore(t)
 	f := newRepo(t, map[string]string{"internal/measure/rekey/replay/main.go": replayStandIn, keysPath: keysBase,
-		"internal/detect/detect.go": detectGo})
+		"internal/detect/failures.go": detectGo})
 	s := shipFor(t, st, f)
 	s.Gate.Resolve = func(context.Context, string) (string, error) { return SelfRepo, nil }
 	c := testingCaseOf(t, st, ownSig, nil)
@@ -82,8 +82,8 @@ func replayFixture(t *testing.T) (*Ship, store.Case, Package) {
 // changeKeys makes the change to the detector: its version moves to two, its test with it, and its keys become keys.
 func changeKeys(t *testing.T, p Package, keys string) {
 	t.Helper()
-	write(t, filepath.Join(p.Work, "internal/detect/detect.go"), strings.Replace(detectGo, "return 1", "return 2", 1))
-	write(t, filepath.Join(p.Work, "internal/detect/detect_test.go"), detectT)
+	write(t, filepath.Join(p.Work, "internal/detect/failures.go"), strings.Replace(detectGo, "return 1", "return 2", 1))
+	write(t, filepath.Join(p.Work, "internal/detect/failures_test.go"), detectT)
 	write(t, filepath.Join(p.Work, keysPath), keys)
 }
 
@@ -131,7 +131,7 @@ func TestADetectorChangeWithNoStoreCopyIsAPersonsToLand(t *testing.T) {
 	s.ReplayStore = ""
 	changeKeys(t, p, keysBase)
 	p, err := s.CheckArgs(ctx, cs.ID, []string{"go", "test", "./internal/detect"}, nil, fixturePatch(t, s, cs.ID))
-	if err != nil || p.State != Checked || !slices.Contains(p.Hand, "internal/detect/detect.go") || p.Check.Replay != nil {
+	if err != nil || p.State != Checked || !slices.Contains(p.Hand, "internal/detect/failures.go") || p.Check.Replay != nil {
 		t.Fatalf("a detector change with no store copy: hand %v state %s: %v", p.Hand, p.State, err)
 	}
 	if err := os.Remove(filepath.Join(filepath.Dir(s.Dir), "store-copy.sqlite")); err != nil && !errors.Is(err, os.ErrNotExist) {

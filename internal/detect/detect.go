@@ -41,8 +41,9 @@ type Detector interface {
 // Sessions sessions (an incident, which has none, counts its repeats).
 type Recur struct{ Events, Sessions int }
 
-// MaxEvidence bounds the evidence one finding files on one run: its newest. A case keeps what earlier runs filed.
-const MaxEvidence = 200
+// MaxEvidence bounds the evidence one finding files on one run: its newest. A case keeps what earlier runs filed. The
+// loop's replay of a detector change lifts it, to compare every event (internal/measure/rekey/replay).
+var MaxEvidence = 200
 
 // maxRows bounds the events a detector reads of one kind over a window.
 const maxRows = 200_000

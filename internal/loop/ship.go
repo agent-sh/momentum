@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -1622,7 +1624,7 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 		return hand, nil
 	}
 	out = slices.Clone(hand)
-	had := map[string][2]map[string]bool{} // each package's imports at the base, by its directory: its landable code's, then every file's
+	had := map[string][3]map[string]bool{} // each package's imports at the base, by its directory: its landable code's, then every file's
 	for _, c := range changed {
 		if !selfLandable(c) || slices.Contains(out, c) {
 			continue
@@ -1661,7 +1663,7 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 			if strings.HasSuffix(c, "_test.go") {
 				imports = had[dir][1]
 			}
-			why = selfKept(c, old, now, imports)
+			why = selfKept(c, old, now, imports, had[dir][2])
 		}
 		if why != "" {
 			out = append(out, c)
@@ -1681,13 +1683,13 @@ func (s *Ship) absent(ctx context.Context, p Package, rev, name string) (bool, e
 // packageImports are the imports of the Go files a directory holds at a revision: of the files the loop lands that are
 // no test files (what a file of its code may add), and of all of them (what a test file may add). A file a person
 // lands, or a test, may import what the loop's code may not.
-func (s *Ship) packageImports(ctx context.Context, p Package, rev, dir string) ([2]map[string]bool, error) {
+func (s *Ship) packageImports(ctx context.Context, p Package, rev, dir string) ([3]map[string]bool, error) {
 	// names end with a NUL (-z): git quotes a name with a byte it does not print
 	list, err := s.git(ctx, p.Host, "ls-tree", "-z", "--name-only", rev, "--", dir+"/")
 	if err != nil {
-		return [2]map[string]bool{}, err
+		return [3]map[string]bool{}, err
 	}
-	out := [2]map[string]bool{{}, {}}
+	out := [3]map[string]bool{{}, {}, {}} // the landable code's imports, every file's, and the names the landable code selects
 	for _, name := range strings.Split(list, "\x00") {
 		if !strings.HasSuffix(name, ".go") {
 			continue
@@ -1702,6 +1704,11 @@ func (s *Ship) packageImports(ctx context.Context, p Package, rev, dir string) (
 				out[1][i] = true
 				if code {
 					out[0][i] = true
+				}
+			}
+			if f, err := parser.ParseFile(token.NewFileSet(), "", b, parser.SkipObjectResolution); err == nil && code {
+				for _, n := range selectors(f) {
+					out[2][n] = true
 				}
 			}
 		}

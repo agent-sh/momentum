@@ -1,6 +1,9 @@
 package loop
 
 import (
+	"reflect"
+
+	"github.com/agent-sh/momentum/internal/store"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -61,7 +64,7 @@ func std(path string) bool {
 //
 // What a function's body does (a test made to prove less, a rule that reads the clock) is the review's, which is
 // told to rate high a change that makes a test prove less or widens what the loop may touch, land or spend.
-func selfKept(name string, old, now []byte, had map[string]bool) string {
+func selfKept(name string, old, now []byte, had map[string]bool, calls ...map[string]bool) string {
 	test := strings.HasSuffix(name, "_test.go")
 	if why := fileKind(name); why != "" {
 		return why
@@ -123,8 +126,19 @@ func selfKept(name string, old, now []byte, had map[string]bool) string {
 		}
 	}
 	if !test {
-		if more := added(doings(is), doings(was)); len(more) > 0 {
+		if more := added(doings(is, now), doings(was, old)); len(more) > 0 {
 			return more[0]
+		}
+		called := map[string]bool{}
+		for _, c := range calls {
+			for k := range c {
+				called[k] = true
+			}
+		}
+		for _, m := range selectors(is) {
+			if storeWrite(m) && !called[m] && !slices.Contains(selectors(was), m) {
+				return "it calls a store method its package's code does not call, which may write what the loop's judgment rests on: " + m
+			}
 		}
 		return ""
 	}
@@ -216,9 +230,14 @@ func fileKind(name string) string {
 
 // doings are what a file's declarations do beyond declaring: its init functions, the package variables whose value
 // runs code, and the package-level names that hide predeclared ones, each as a sentence.
-func doings(f *ast.File) []string {
+func doings(f *ast.File, src []byte) []string {
 	if f == nil {
 		return nil
+	}
+	fset := token.NewFileSet()
+	f2, err := parser.ParseFile(fset, "", src, parser.SkipObjectResolution)
+	if err == nil {
+		f = f2 // positions of this file set, to read each value's source
 	}
 	var out []string
 	inits := 0
@@ -244,7 +263,12 @@ func doings(f *ast.File) []string {
 						})
 					}
 					if runs && d.Tok == token.VAR {
-						out = append(out, "it adds a package variable whose value runs code: "+strings.Join(names(spec.Names), ", "))
+						// its source with it: a value that runs code, rewritten, is another initializer
+						text := strings.Join(names(spec.Names), ", ")
+						if err == nil {
+							text += " = " + string(src[fset.Position(spec.Pos()).Offset:fset.Position(spec.End()).Offset])
+						}
+						out = append(out, "it adds or rewrites a package variable whose value runs code: "+text)
 					}
 				case *ast.TypeSpec:
 					if types.Universe.Lookup(spec.Name.Name) != nil {
@@ -285,4 +309,38 @@ func added(now, was []string) []string {
 		}
 	}
 	return out
+}
+
+// selectors are the names a file selects (x.Name), each once.
+func selectors(f *ast.File) []string {
+	if f == nil {
+		return nil
+	}
+	var out []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok && !slices.Contains(out, sel.Sel.Name) {
+			out = append(out, sel.Sel.Name)
+		}
+		return true
+	})
+	return out
+}
+
+// storeReads are the prefixes of the store's methods that only read.
+var storeReads = []string{"Events", "Event", "Before", "Calls", "Cases", "CaseByID", "CaseLog", "Notes", "Owner", "Thread", "Session", "Activity",
+	"Unread", "ReadThrough", "Incomplete", "Timeline", "Texts", "Sent", "Phases", "Size", "Path", "Seq", "Evidence", "HandFixes", "Ask", "Sys",
+	"Choose"}
+
+// storeWrite says whether a name is a method of the store that may write: any method of *store.Store but Close, which
+// only ends the handle, whose name opens with none of storeReads.
+func storeWrite(name string) bool {
+	if _, ok := reflect.TypeOf(&store.Store{}).MethodByName(name); !ok || name == "Close" {
+		return false
+	}
+	for _, r := range storeReads {
+		if strings.HasPrefix(name, r) {
+			return false
+		}
+	}
+	return true
 }

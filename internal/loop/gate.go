@@ -243,12 +243,18 @@ var selfLand = []string{
 	"README.md",
 }
 
-// selfHand are the parts of selfLand that stay a person's to land: the sessions detector, which reads the transcripts
+// selfHand are the parts of selfLand that stay a person's to land: the detectors' frame (detect.go: the run that files
+// findings and sweeps cases, the signatures' versions and the text normalization the stop rule keys refusals by, the
+// evidence bound; keyed.go: what the measure step keys and which families it decides), which the replay does not
+// read; the sessions detector, which reads the transcripts
 // and Hermes's database, so no copy of the store replays it; supervision's history and replay, which the sessions
 // detector reads and which measure the rules; the one part of the session layer that types into a session, whose
 // checks keep a message from answering a dialog or a permission; and what the store, which no change touches, builds
-// on: the session layer's own package (its files directly under sessions/, sessionsRoot) and its stamps.
-var selfHand = []string{"internal/detect/sessions.go", "internal/supervise/history.go", "internal/supervise/replay.go", "sessions/act/", "sessions/state/"}
+// on: the session layer's own package (its files directly under sessions/, sessionsRoot), its stamps, its process and
+// terminal readers and its internal text.
+var selfHand = []string{"internal/detect/detect.go", "internal/detect/keyed.go", "internal/detect/sessions.go",
+	"internal/supervise/history.go", "internal/supervise/replay.go",
+	"sessions/act/", "sessions/state/", "sessions/proc/", "sessions/term/", "sessions/internal/"}
 
 // sessionsRoot is the session layer's own package, which the store imports: its files directly under sessions/.
 func sessionsRoot(c string) bool {

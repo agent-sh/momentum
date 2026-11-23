@@ -1504,7 +1504,7 @@ func TestAFindingFilesItsNewestEvidence(t *testing.T) {
 	if err != nil || len(fs) != 1 || len(fs[0].Evidence) != MaxEvidence {
 		t.Fatalf("%d findings, %v", len(fs), err)
 	}
-	if !fs[0].Evidence[0].At.Equal(t0.Add(MaxEvidence*time.Minute)) || !fs[0].Evidence[MaxEvidence-1].At.Equal(t0.Add(time.Minute)) {
+	if !fs[0].Evidence[0].At.Equal(t0.Add(time.Duration(MaxEvidence)*time.Minute)) || !fs[0].Evidence[MaxEvidence-1].At.Equal(t0.Add(time.Minute)) {
 		t.Fatalf("not the newest: %v .. %v", fs[0].Evidence[0].At, fs[0].Evidence[MaxEvidence-1].At)
 	}
 }
