@@ -793,6 +793,9 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 		return stageFailureIn(ctx, res, "build patch", err)
 	}
 	snapshot := Patch{data: data}
+	// a change to the loop's own detectors is replayed over the pass's copy of the store (selfReplay)
+	r.Ship.ReplayStore = r.passStore()
+	defer func() { r.Ship.ReplayStore = "" }()
 	if _, err := r.Ship.CheckArgs(ctx, c.ID, report.Test, nil, snapshot); err != nil {
 		return stageFailureIn(ctx, res, "build check", paidCheck(err))
 	}
@@ -806,6 +809,18 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 		return stageFailureIn(ctx, res, "build propose", err)
 	}
 	return res, nil
+}
+
+// passStore is the pass's scrubbed copy of the store, when the pass made one, else "".
+func (r *Runner) passStore() string {
+	if r.pass == nil || r.pass.err != nil || r.pass.dir == "" {
+		return ""
+	}
+	path := filepath.Join(r.pass.dir, "store.sqlite")
+	if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	return path
 }
 
 func firstError(err error, message string) error {
@@ -860,18 +875,18 @@ func buildScope(repo string) string {
 	if !strings.EqualFold(repo, SelfRepo) {
 		return "Paths: the loop lands a change to any path of this repository except CI configuration (" + ci + "), which no change touches."
 	}
-	return "Paths: this is the loop's own repository. The loop lands a change only when every path it touches is one of " +
-		strings.Join(SelfLandable(), ", ") + ": prefer a fix inside them. A rules file lands while it was there before and its change " +
-		"adds no import, no initializer (an init function, or a package variable whose value holds a call or a function), no " +
-		"compiler directive and no name that hides a predeclared one. The loop's own test file (" + strings.Join(SelfLandableTests(), ", ") +
-		") lands with the rules when the change only appends whole test functions (func TestXxx(t *testing.T)) after what the file " +
-		"held, with no other declaration, import or directive: put the test of a rule's fix there, and leave the package's other " +
-		"test files as they are. A test there can name the packages that file already imports (testing, strings, time, sessions, " +
-		"sessions/act) and the package's own helpers, and no other package. The host then runs the package's whole test suite " +
-		"on the change: it must pass. A fix that needs other paths is still checked and reviewed, " +
-		"then proposed for a person to land by hand; the loop never lands it. No change touches CI configuration (" + ci +
-		") or these, which the loop's measurement and its event scanners rest on: " + strings.Join(ProposalProtected(), ", ") +
-		" " + ownReachException + "."
+	return "Paths: this is the loop's own repository. The loop lands a change itself when every path it touches is one of " +
+		strings.Join(SelfLandable(), ", ") + " (each file's own test file with it), but not " + strings.Join(SelfHand(), ", ") + ". " +
+		"In those paths a change may add files and tests, and the host reads its Go files: each must parse, add no comment the toolchain " +
+		"reads (a //go: directive, a build constraint), and add no import its package does not already have but the standard library " +
+		"(not " + strings.Join(riskyImports, ", ") + ") and this module's own packages; a test file must keep every test function it held, " +
+		"and add no TestMain and no Skip, SkipNow or Skipf. The host then vets the whole module and runs the whole test suite of each " +
+		"package the change touches: both must pass. A change to internal/detect/ is replayed over the last week of the stored " +
+		"history with the base's detectors and with the change's: it may key events by other signatures, and it may stop keying the " +
+		"events of this case's own signatures when they are no failures, but a change that stops keying events of any other signature " +
+		"is refused. A fix that needs other paths is still checked and reviewed, then proposed for a person to land by hand; the loop " +
+		"never lands it. No change touches CI configuration (" + ci + ") or these, which the loop's judgment and authority rest on: " +
+		strings.Join(ProposalProtected(), ", ") + " " + ownReachException + "."
 }
 
 // reviewPrompt is a review's task. It carries the paths the build was given (buildScope), so a reviewer knows what the
@@ -910,9 +925,11 @@ func handReach(p Package) string {
 // may add a check or tighten one, and what makes a test prove less, or widens the loop's own reach, is a person's
 // to decide. The host has read the change's declarations; what its functions do is the review's.
 const selfReach = " The loop lands this change itself, with no person between. It may add a check or tighten one. File a high finding when " +
-	"it makes a test prove less than it did (a rule that tells a test run from a real one, by the clock or by anything else; a " +
-	"function that sets a variable of another file; an added test that changes what a later test sees), or widens what the loop " +
-	"may touch, land or spend: a person lands such a change."
+	"it makes a test prove less than it did (an old test's assertion loosened; a rule that tells a test run from a real one, by the " +
+	"clock or by anything else; a function that sets a variable of another file; an added test that changes what a later test sees), " +
+	"weakens a guard that keeps a session from being typed into or its owner from being woken, re-keys or drops detector events " +
+	"beyond the case's own problem (the check's replay counts them), or widens what the loop may touch, land or spend: a person " +
+	"lands such a change."
 
 // refusalKeys are the build stages whose failure is the run's own output: its report, its patch, its check or its
 // proposal. Preparation, inputs, toolchains and authority are the host's and tell a build nothing to change.

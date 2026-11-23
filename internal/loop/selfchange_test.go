@@ -1,10 +1,6 @@
 package loop
 
 import (
-	"os"
-	"path"
-	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -19,80 +15,81 @@ const (
 	rulesTestPath = "internal/supervise/zz_loop_test.go"
 )
 
-// A test file's change is the loop's to land only when it appends whole test functions: everything else that a
-// change can do to a test file takes a check away, or runs before one, and is told from an append by parsing.
-func TestOnlyAppendedTestFunctionsAreAnAddedCheck(t *testing.T) {
-	if names, why := appendedTests([]byte(selfRulesTest), []byte(selfRulesTest+selfNewTest+"\nfunc Test_two(t *testing.T) {}\n")); why != "" ||
-		!slices.Equal(names, []string{"TestLimitIsTwo", "Test_two"}) {
-		t.Fatalf("two appended tests: %v %q", names, why)
-	}
-	for name, c := range map[string]struct{ old, changed, why string }{
-		"a line of an old test rewritten": {selfRulesTest, strings.Replace(selfRulesTest, "Limit() <= 0", "Limit() < -5", 1) + selfNewTest, "changes or removes"},
-		"a skip put inside an old test":   {selfRulesTest, strings.Replace(selfRulesTest, "\tif Limit", "\tt.Skip()\n\tif Limit", 1) + selfNewTest, "changes or removes"},
-		"an old test removed":             {selfRulesTest, "package supervise\n\nimport \"testing\"\n" + selfNewTest, "changes or removes"},
-		"a new file":                      {"", selfRulesTest, "new"},
-		"nothing added":                   {selfRulesTest, selfRulesTest, "adds nothing"},
-		"a comment alone":                 {selfRulesTest, selfRulesTest + "\n// a note\n", "no test function"},
-		"a TestMain":                      {selfRulesTest, selfRulesTest + selfNewTest + "\nfunc TestMain(m *testing.M) {}\n", "no test"},
-		"a TestMain that takes a T":       {selfRulesTest, selfRulesTest + "\nfunc TestMain(t *testing.T) {}\n", "no test"},
-		"an initializer":                  {selfRulesTest, selfRulesTest + selfNewTest + "\nfunc init() { panic(1) }\n", "no test"},
-		"a variable":                      {selfRulesTest, selfRulesTest + selfNewTest + "\nvar _ = func() int { panic(1) }()\n", "no test function"},
-		"a type":                          {selfRulesTest, selfRulesTest + selfNewTest + "\ntype x int\n", "no test function"},
-		"a helper function":               {selfRulesTest, selfRulesTest + selfNewTest + "\nfunc helper(t *testing.T) {}\n", "no test"},
-		"a lower-case test name":          {selfRulesTest, selfRulesTest + "\nfunc Testing(t *testing.T) {}\n", "no test"},
-		"a method":                        {selfRulesTest + "\ntype x int\n", selfRulesTest + "\ntype x int\n" + "\nfunc (x) TestX(t *testing.T) {}\n", "no test function"},
-		"a benchmark's argument":          {selfRulesTest, selfRulesTest + "\nfunc TestB(b *testing.B) {}\n", "*testing.T"},
-		"two arguments":                   {selfRulesTest, selfRulesTest + "\nfunc TestB(t, u *testing.T) {}\n", "*testing.T"},
-		"a type parameter":                {selfRulesTest, selfRulesTest + "\nfunc TestB[T any](t *testing.T) {}\n", "no test function"},
-		"a build constraint":              {selfRulesTest, selfRulesTest + "\n//go:build never\n" + selfNewTest, "toolchain"},
-		"a linked name":                   {selfRulesTest, selfRulesTest + "\n//go:linkname TestL runtime.x\nfunc TestL(t *testing.T) {}\n", "toolchain"},
-		"a block comment opened":          {selfRulesTest, selfRulesTest + "\n/*\n", "does not parse"},
-		"a file that ended inside a line": {strings.TrimSuffix(selfRulesTest, "\n"), selfRulesTest + selfNewTest, "line's end"},
-		"an import":                       {"package supervise\n\nimport \"testing\"\n", "package supervise\n\nimport \"testing\"\n\nimport \"os\"\n" + selfNewTest, "no test function"},
-		"testing under another name":      {strings.Replace(selfRulesTest, "import \"testing\"", "import testing \"fmt\"", 1), strings.Replace(selfRulesTest, "import \"testing\"", "import testing \"fmt\"", 1) + selfNewTest, "import testing"},
-		"an end inside a line":            {selfRulesTest, selfRulesTest + "\nfunc TestN(t *testing.T) {}", "line's end"},
-		"an old file that does not parse": {"package supervise\n\nfunc {\n", "package supervise\n\nfunc {\n" + selfNewTest, "did not parse"},
-	} {
-		if names, why := appendedTests([]byte(c.old), []byte(c.changed)); why == "" || !strings.Contains(why, c.why) || names != nil {
-			t.Errorf("%s: names %v, why %q, want a refusal with %q", name, names, why, c.why)
+// The loop lands its own detectors, supervision, session readers and printing commands, and nothing its judgment or
+// authority rests on: the parts of those directories a replay over the store cannot read, and the part that types
+// into a session, stay a person's.
+func TestTheLoopLandsAllButWhatItsJudgmentRestsOn(t *testing.T) {
+	for _, c := range []string{"internal/detect/failures.go", "internal/detect/failures_test.go", "internal/detect/new.go", "internal/supervise/engine.go",
+		"internal/supervise/rules_test.go", "internal/supervise/zz_loop_test.go", "internal/evidenceview/view.go", "internal/request/state.go",
+		"sessions/claude/scan.go", "sessions/new/file.go", "internal/capacity/rules.go", "internal/capacity/rules_test.go",
+		"cmd/momentum/report.go", "cmd/momentum/report_test.go", "README.md"} {
+		if !selfLandable(c) || proposalProtected(c) {
+			t.Errorf("%s: landable %v, protected %v", c, selfLandable(c), proposalProtected(c))
 		}
+	}
+	for _, c := range []string{"internal/detect/sessions.go", "internal/detect/sessions_test.go", "internal/supervise/replay.go", "internal/supervise/history.go",
+		"sessions/act/act.go", "internal/source/transcripts.go", "internal/toolresult/x.go", "internal/plain/plain.go", "internal/capacity/names.go",
+		"SPEC.md", "AGENTS.md", "LICENSE", "Internal/detect/failures.go"} {
+		if selfLandable(c) || proposalProtected(c) {
+			t.Errorf("%s is a person's to land: landable %v, protected %v", c, selfLandable(c), proposalProtected(c))
+		}
+	}
+	for _, c := range []string{"internal/loop/gate.go", "internal/measure/rekey/rekey.go", "internal/measure/rekey/replay/main.go", "internal/sandbox/x.go",
+		"internal/ro/ro.go", "internal/tracked/check/main.go", "internal/config/config.go", "internal/paths/paths.go", "internal/store/store.go",
+		"internal/scorecard/score.go", "internal/weekly/week.go", "internal/capacity/acts.go", "internal/capacity/run.go", "cmd/momentum/loop.go",
+		"cmd/momentum/supervise.go", "cmd/momentum/new.go", "cmd/momentum/report_extra_test.go", "go.mod", "go.sum", "vendor/x/y.go", "Internal/Loop/gate.go"} {
+		if selfLandable(c) || !proposalProtected(c) {
+			t.Errorf("%s is what the loop's judgment or authority rests on: landable %v, protected %v", c, selfLandable(c), proposalProtected(c))
+		}
+	}
+	if !isReplayed("internal/detect/failures.go") || isReplayed("internal/detect/sessions.go") || isReplayed("internal/supervise/rules.go") {
+		t.Error("only a landable detector change is replayed")
 	}
 }
 
-// The terms hold for the files they are for: the repository's own rules file changes nothing by standing as it is,
-// and its test file takes an appended test.
-func TestTheRepositorysOwnRulesFilesMeetTheTerms(t *testing.T) {
-	rules, err := os.ReadFile("../../" + rulesPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if why := rulesKept(rules, append(slices.Clone(rules), "\n// more is one more.\nfunc more(n int) int { return n + 1 }\n"...)); why != "" {
-		t.Fatalf("the rules file with one more function: %q", why)
-	}
-	test, err := os.ReadFile("../../" + rulesTestPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if names, why := appendedTests(test, append(slices.Clone(test), "\nfunc TestOneMore(t *testing.T) {\n\tif len(Rules) == 0 {\n\t\tt.Fatal(\"no rule\")\n\t}\n}\n"...)); why != "" || !slices.Equal(names, []string{"TestOneMore"}) {
-		t.Fatalf("the rules' test file with one more test: %v %q", names, why)
-	}
-	// the loop's tests run after every other test of the package, as the package's test files stand
-	for file, rules := range selfTests {
-		names, err := filepath.Glob("../../" + path.Dir(file) + "/*_test.go")
-		if err != nil || len(names) < 2 {
-			t.Fatalf("the test files beside %s: %v %v", file, names, err)
+// A change the loop lands keeps its package within what it could do and keeps the checks its tests make; everything
+// else in it is the review's.
+func TestALandableFilesChangeKeepsItsPackageAndItsTests(t *testing.T) {
+	two := strings.Replace(selfRules, "limit = 1", "limit = 2", 1)
+	had := map[string]bool{"fmt": true, "testing": true}
+	for name, c := range map[string]struct {
+		file     string
+		old, now string
+		had      map[string]bool
+		why      string
+	}{
+		"a rule's change":                {rulesPath, selfRules, two, had, ""},
+		"an initializer":                 {rulesPath, selfRules, two + "\nfunc init() { limit = 3 }\n", had, ""},
+		"a standard import":              {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os\"\n)", 1) + "\nvar _ = os.Args\n", had, ""},
+		"a module import":                {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"github.com/agent-sh/momentum/internal/plain\"\n)", 1), had, ""},
+		"a risky import":                 {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os/exec\"\n)", 1), had, "os/exec"},
+		"the network":                    {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"net/http\"\n)", 1), had, "net/http"},
+		"a risky import its package has": {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os/exec\"\n)", 1), map[string]bool{"os/exec": true}, ""},
+		"another module":                 {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import \"golang.org/x/sys/unix\"", 1), had, "golang.org/x/sys/unix"},
+		"a build constraint":             {rulesPath, selfRules, "//go:build never\n\n" + selfRules, had, "toolchain"},
+		"a linked name":                  {rulesPath, selfRules, selfRules + "\n//go:linkname name runtime.x\n", had, "toolchain"},
+		"a file that does not parse":     {rulesPath, selfRules, selfRules + "func {\n", had, "does not parse"},
+		"a new file":                     {"internal/supervise/new.go", "", "package supervise\n\nfunc New() int { return 1 }\n", had, ""},
+		"a file deleted":                 {rulesPath, selfRules, "", had, ""},
+		"a test appended":                {rulesTestPath, selfRulesTest, selfRulesTest + selfNewTest, had, ""},
+		"a test's body rewritten":        {rulesTestPath, selfRulesTest, strings.Replace(selfRulesTest, "<= 0", "< 0", 1), had, ""},
+		"a test taken away":              {rulesTestPath, selfRulesTest + selfNewTest, selfRulesTest, had, "TestLimitIsTwo"},
+		"a test renamed":                 {rulesTestPath, selfRulesTest, strings.Replace(selfRulesTest, "TestLimitIsPositive", "TestLimitIsAbove", 1), had, "TestLimitIsPositive"},
+		"a skip put inside an old test":  {rulesTestPath, selfRulesTest, strings.Replace(selfRulesTest, "\tif Limit", "\tt.Skip()\n\tif Limit", 1), had, "Skip"},
+		"a TestMain":                     {rulesTestPath, selfRulesTest, selfRulesTest + "\nfunc TestMain(m *testing.M) {}\n", had, "TestMain"},
+		"a test file deleted":            {rulesTestPath, selfRulesTest, "", had, "deletes a test file"},
+		"a new test file":                {"internal/supervise/new_test.go", "", selfRulesTest, had, ""},
+		"a file that is not Go":          {"internal/detect/testdata/x.txt", "a", "b", had, ""},
+	} {
+		var old, now []byte
+		if c.old != "" {
+			old = []byte(c.old)
 		}
-		files := map[string][]byte{}
-		for _, name := range names {
-			if files[filepath.Base(name)], err = os.ReadFile(name); err != nil {
-				t.Fatal(err)
-			}
+		if c.now != "" {
+			now = []byte(c.now)
 		}
-		if why := runLast(files, path.Base(file)); why != "" {
-			t.Errorf("the tests of %s do not run last: %s", file, why)
-		}
-		if path.Dir(rules) != path.Dir(file) || !slices.Contains(selfChanges, rules) {
-			t.Errorf("%s lands with %s, which is no rules file of its package", file, rules)
+		if why := selfKept(c.file, old, now, c.had); c.why == "" && why != "" || c.why != "" && !strings.Contains(why, c.why) {
+			t.Errorf("%s: why %q, want %q", name, why, c.why)
 		}
 	}
 }
@@ -108,85 +105,6 @@ func TestOnlyALoopLandingsReviewIsToldItsTerms(t *testing.T) {
 	for name, p := range map[string]Package{"a hand landing": {Repo: SelfRepo, Hand: []string{"internal/x.go"}}, "another repository": {Repo: "agent-sh/other"}} {
 		if strings.Contains(reviewPrompt(c, p), "lands this change itself") {
 			t.Errorf("%s's review is told the loop lands it", name)
-		}
-	}
-}
-
-// A rules file's change is the loop's to land while it gives the file no other import, initializer or compiler
-// directive, and the file was there.
-func TestARulesFileKeepsItsImportsAndHasNoInitializer(t *testing.T) {
-	if why := rulesKept([]byte(selfRules), []byte(strings.Replace(selfRules, "limit = 1", "limit = 2", 1)+"\n// Twice is the limit twice.\nfunc Twice() int { return 2 * Limit() }\n")); why != "" {
-		t.Fatalf("a rule's change: %q", why)
-	}
-	for name, c := range map[string]struct{ changed, why string }{
-		"another import":                        {strings.Replace(selfRules, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os\"\n)", 1) + "\nvar _ = os.Args\n", "adds an import: os"},
-		"an import under a name":                {strings.Replace(selfRules, "import \"fmt\"", "import fmt \"os\"", 1), "adds an import: os"},
-		"an import for its effects":             {strings.Replace(selfRules, "import \"fmt\"", "import (\n\t\"fmt\"\n\t_ \"testing\"\n)", 1), "adds an import: testing"},
-		"an initializer":                        {selfRules + "\nfunc init() { panic(1) }\n", "initializer"},
-		"a build constraint":                    {"//go:build never\n\n" + selfRules, "toolchain"},
-		"a linked name":                         {selfRules + "\n//go:linkname name runtime.x\n", "toolchain"},
-		"another package":                       {strings.Replace(selfRules, "package supervise", "package other", 1), "renames"},
-		"a file that does not parse":            {selfRules + "func {\n", "does not parse"},
-		"a variable set by a function it calls": {selfRules + "\nvar _ = func() bool { limit = 9; return true }()\n", "whose value runs code"},
-		"a variable set by a call":              {selfRules + "\nvar started = fmt.Sprint(1)\n", "whose value runs code"},
-		"a variable that is a function":         {selfRules + "\nvar hook = func() {}\n", "whose value runs code"},
-		"a function named as a builtin":         {selfRules + "\nfunc len(s string) int { return 0 }\n", "hides a predeclared one: len"},
-		"a constant named true":                 {selfRules + "\nconst true = false\n", "hides a predeclared one: true"},
-		"a type named string":                   {selfRules + "\ntype string int\n", "hides a predeclared one: string"},
-	} {
-		if why := rulesKept([]byte(selfRules), []byte(c.changed)); !strings.Contains(why, c.why) {
-			t.Errorf("%s: why %q, want %q", name, why, c.why)
-		}
-	}
-	if why := rulesKept(nil, []byte(selfRules)); !strings.Contains(why, "new") {
-		t.Errorf("a new rules file: %q", why)
-	}
-	if why := rulesKept([]byte("//go:build linux\n\n"+selfRules), []byte("//go:build linux\n\n"+selfRules+"\nfunc more() {}\n")); why != "" {
-		t.Errorf("a directive the file already held: %q", why)
-	}
-	// what the file held it may keep: only what the change brings is read against the terms
-	held := selfRules + "\nvar started = fmt.Sprint(1)\n\nfunc init() { limit = 3 }\n"
-	if why := rulesKept([]byte(held), []byte(held+"\nfunc more() { limit++ }\n")); why != "" {
-		t.Errorf("a file that already held an initializer: %q", why)
-	}
-	if why := rulesKept([]byte(held), []byte(held+"\nfunc init() { limit = 4 }\n")); !strings.Contains(why, "initializer") {
-		t.Errorf("a second initializer: %q", why)
-	}
-	// a constant runs nothing
-	if why := rulesKept([]byte(selfRules), []byte(selfRules+"\nconst grace = float64(90) * 2\n")); why != "" {
-		t.Errorf("a constant with a conversion: %q", why)
-	}
-}
-
-// The loop's tests run after every other test of their package while the other test files leave the go command's
-// order alone: none sorts after the loop's, is of the external test package, holds a TestMain, a fuzz test or an
-// example, or runs a test in parallel.
-func TestTheLoopsTestsRunLast(t *testing.T) {
-	own := "package p\n\nimport \"testing\"\n\nfunc TestOwn(t *testing.T) { t.Parallel() }\n"
-	other := "package p\n\nimport \"testing\"\n\nfunc TestOther(t *testing.T) {\n\tt.Run(\"sub\", func(t *testing.T) {})\n}\n\nfunc BenchmarkX(b *testing.B) {}\n"
-	if why := runLast(map[string][]byte{"a_test.go": []byte(other), "zz_loop_test.go": []byte(own)}, "zz_loop_test.go"); why != "" {
-		t.Fatalf("a package whose tests run in the files' order: %q", why)
-	}
-	for name, c := range map[string]struct{ file, body, why string }{
-		"a later file":                    {"zzz_test.go", other, "sorts after"},
-		"the external test package":       {"ext_test.go", strings.Replace(other, "package p", "package p_test", 1), "another package"},
-		"a TestMain":                      {"a_test.go", other + "\nfunc TestMain(m *testing.M) {}\n", "TestMain"},
-		"a fuzz test":                     {"a_test.go", other + "\nfunc FuzzX(f *testing.F) {}\n", "FuzzX"},
-		"an example":                      {"a_test.go", other + "\nfunc ExampleX() {}\n", "ExampleX"},
-		"a parallel test":                 {"a_test.go", other + "\nfunc TestP(t *testing.T) { t.Parallel() }\n", "parallel"},
-		"a parallel subtest":              {"a_test.go", other + "\nfunc TestP(t *testing.T) {\n\tt.Run(\"s\", func(u *testing.T) { u.Parallel() })\n}\n", "parallel"},
-		"Parallel as a method expression": {"a_test.go", other + "\nfunc TestP(t *testing.T) { (*testing.T).Parallel(t) }\n", "parallel"},
-		"Parallel as a method value":      {"a_test.go", other + "\nfunc TestP(t *testing.T) {\n\tp := t.Parallel\n\tp()\n}\n", "parallel"},
-		"a file that does not parse":      {"a_test.go", "package p\n\nfunc {\n", "does not parse"},
-		"the loop's file not among it":    {"zz_loop_test.go", "", "not among"},
-	} {
-		files := map[string][]byte{"a_test.go": []byte(other), "zz_loop_test.go": []byte(own)}
-		files[c.file] = []byte(c.body)
-		if c.body == "" {
-			delete(files, c.file)
-		}
-		if why := runLast(files, "zz_loop_test.go"); !strings.Contains(why, c.why) {
-			t.Errorf("%s: %q, want %q", name, why, c.why)
 		}
 	}
 }

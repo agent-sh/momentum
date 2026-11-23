@@ -534,24 +534,25 @@ func TestTheGateKeepsTheLoopsAuthority(t *testing.T) {
 	if _, err := g.Repository(ctx, f.main); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "report_only") {
 		t.Errorf("the scope check's report only: %v", err)
 	}
-	for _, p := range []string{"internal/detect/failures.go", "internal/loop/gate.go", "internal/sandbox/sandbox.go", "internal/sandbox/new.go", "internal/measure/x.go", "internal/store/events.go",
+	for _, p := range []string{"internal/loop/gate.go", "internal/sandbox/sandbox.go", "internal/sandbox/new.go", "internal/measure/x.go", "internal/store/events.go",
 		"internal/source/transcripts.go", "internal/plain/plain.go", "internal/config/config.go", "internal/paths/paths.go",
-		"internal/tracked/check/main.go", "internal/capacity/act.go", "internal/supervise/engine.go", "internal/toolresult/x.go",
-		"sessions/new/file.go", "cmd/new/file.go", "internal/new/file.go", "LICENSE", ".gitignore", "README.md", "new-root-file",
-		"scripts/new-guard.sh", "docs/new-policy.md", "internal/supervise/rules_test.go",
+		"internal/tracked/check/main.go", "internal/capacity/act.go", "internal/toolresult/x.go", "internal/detect/sessions.go", "sessions/act/act.go",
+		"cmd/new/file.go", "internal/new/file.go", "LICENSE", ".gitignore", "new-root-file",
+		"scripts/new-guard.sh", "docs/new-policy.md",
 		"cmd/momentum/git.go", "cmd/momentum/replay.go", "go.mod", "go.sum", ".github/workflows/ci.yml", "SPEC.md", "AGENTS.md"} {
 		if err := CheckPaths(Target{Repo: SelfRepo}, []string{p}); !errors.Is(err, ErrRefused) {
 			t.Errorf("momentum's own %s: %v", p, err)
 		}
 	}
-	if err := CheckPaths(Target{Repo: SelfRepo}, []string{"internal/supervise/rules.go", "internal/capacity/rules.go"}); err != nil {
-		t.Errorf("supervision's and capacity's rules are no evaluator: %v", err)
+	if err := CheckPaths(Target{Repo: SelfRepo}, []string{"internal/supervise/rules.go", "internal/capacity/rules.go", "internal/detect/failures.go",
+		"internal/supervise/engine.go", "sessions/new/file.go", "README.md", "internal/supervise/rules_test.go"}); err != nil {
+		t.Errorf("the loop's detectors, supervision and session readers are no evaluator: %v", err)
 	}
 	if err := CheckPaths(Target{Repo: "agent-sh/fake"}, []string{"internal/loop/x.go"}); err != nil {
 		t.Errorf("another repository's paths: %v", err)
 	}
 	Protected()[0] = "x"
-	if err := CheckPaths(Target{Repo: SelfRepo}, []string{"internal/detect/x.go"}); !errors.Is(err, ErrRefused) {
+	if err := CheckPaths(Target{Repo: SelfRepo}, []string{"cmd/momentum/x.go"}); !errors.Is(err, ErrRefused) {
 		t.Errorf("a change to the list one call returned changed the next: %v", err)
 	}
 }

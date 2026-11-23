@@ -150,6 +150,12 @@ func (o OwnerBurden) Detect(ctx context.Context, st *store.Store, w Window) ([]s
 	if r == (Recur{}) {
 		r = OwnerRecur
 	}
+	occ, err := o.sightings(ctx, st, w)
+	return gather("owner-burden", occ, r), err
+}
+
+// sightings are the owner's classed turns over a window, before any threshold.
+func (o OwnerBurden) sightings(ctx context.Context, st *store.Store, w Window) ([]occurrence, error) {
 	turns, program, err := ownerTurns(ctx, st, o.Programs, w.Since.Add(-repeatSpan), w.Until, w.Since)
 	if err != nil {
 		return nil, err
@@ -181,7 +187,7 @@ func (o OwnerBurden) Detect(ctx context.Context, st *store.Store, w Window) ([]s
 		}
 		agent, err := agentWords(ctx, st, t.Session, after, t.TS)
 		if err != nil {
-			return gather("owner-burden", occ, r), err
+			return occ, err
 		}
 		class := OwnerClass(strings.TrimSpace(t.Summary), agent, before)
 		if class == "" {
@@ -189,7 +195,7 @@ func (o OwnerBurden) Detect(ctx context.Context, st *store.Store, w Window) ([]s
 		}
 		occ = append(occ, occurrence{sig: signature("owner-burden", class), title: ownerTitles[class], ev: t})
 	}
-	return gather("owner-burden", occ, r), nil
+	return occ, nil
 }
 
 // agentWords are the agent's last words in a session from after up to before: its newest agent text that is not a

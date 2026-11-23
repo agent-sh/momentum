@@ -70,12 +70,12 @@ func TestTheBuildBriefShowsTheTestCommandContract(t *testing.T) {
 	}
 }
 
-// A build is told the paths it may land before it starts: in the loop's own repository its two landable files, that a
-// fix elsewhere is proposed for a hand landing, and what no change touches.
+// A build is told the paths it may land before it starts: in the loop's own repository the paths it lands and the
+// terms it lands them on, that a fix elsewhere is proposed for a hand landing, and what no change touches.
 func TestABuildIsToldItsPathsUpFront(t *testing.T) {
 	self := buildScope(SelfRepo)
-	for _, want := range []string{"internal/supervise/rules.go", "internal/capacity/rules.go", "prefer a fix inside them", "land by hand",
-		"internal/loop/", "internal/tracked/", ".github/"} {
+	for _, want := range []string{"internal/supervise/", "internal/capacity/rules.go", "internal/detect/", "but not internal/detect/sessions.go", "replayed over",
+		"land by hand", "internal/loop/", "internal/tracked/", "internal/store/", "internal/scorecard/", ".github/"} {
 		if !strings.Contains(self, want) {
 			t.Fatalf("the loop's own scope lacks %q: %s", want, self)
 		}
@@ -179,11 +179,12 @@ func TestACheckResolvesItsProgramOnTheSandboxPath(t *testing.T) {
 	}
 }
 
-// PathScope refuses CI configuration anywhere and the loop's measurement and scanners in its own repository, lands
-// its two allowed files, and returns every other path of its own repository for a hand landing.
+// PathScope refuses CI configuration anywhere and what the loop's judgment and authority rest on in its own
+// repository, lands the paths it lands, and returns every other path of its own repository for a hand landing.
 func TestPathScopeSortsHandLandingPaths(t *testing.T) {
 	self := Target{Repo: SelfRepo}
-	if hand, err := PathScope(self, []string{"internal/capacity/rules.go", "internal/supervise/rules.go"}); err != nil || len(hand) != 0 {
+	if hand, err := PathScope(self, []string{"internal/capacity/rules.go", "internal/supervise/rules.go", "internal/supervise/engine.go", "internal/detect/failures.go",
+		"sessions/claude/scan.go", "cmd/momentum/report.go", "README.md"}); err != nil || len(hand) != 0 {
 		t.Fatalf("landable paths: %v %v", hand, err)
 	}
 	hand, err := PathScope(self, []string{"internal/capacity/rules.go", "internal/capacity/names.go", "internal/capacity/names_test.go", "SPEC.md"})
@@ -194,14 +195,14 @@ func TestPathScopeSortsHandLandingPaths(t *testing.T) {
 		t.Fatalf("a hand landing path lands: %v", err)
 	}
 	for _, p := range []string{".github/workflows/ci.yml", "internal/tracked/check/main.go", "internal/loop/gate.go", "internal/measure/fisher.go",
-		"sessions/claude/scan.go", "internal/source/transcripts.go", "internal/store/store.go", "internal/capacity/run.go", "internal/supervise/engine.go",
-		"cmd/momentum/main.go", "go.mod"} {
+		"internal/store/store.go", "internal/capacity/run.go", "cmd/momentum/main.go", "internal/scorecard/x.go", "go.mod"} {
 		if _, err := PathScope(self, []string{"internal/capacity/names.go", p}); !errors.Is(err, ErrRefused) {
 			t.Fatalf("%s may be proposed: %v", p, err)
 		}
 	}
-	if hand, err := PathScope(self, []string{"internal/supervise/rules_test.go"}); err != nil || len(hand) != 1 {
-		t.Fatalf("the supervision rules' test: %v %v", hand, err)
+	if hand, err := PathScope(self, []string{"internal/supervise/rules_test.go", "internal/source/transcripts.go", "sessions/act/act.go"}); err != nil ||
+		!slices.Equal(hand, []string{"internal/source/transcripts.go", "sessions/act/act.go"}) {
+		t.Fatalf("the supervision rules' test lands, a source and the session input are a person's: %v %v", hand, err)
 	}
 	for _, p := range []string{"go.work", "go.work.sum", "vendor/modules.txt", "Internal/Loop/gate.go", "GO.MOD", ".GitHub/workflows/x.yml"} {
 		if _, err := PathScope(self, []string{p}); !errors.Is(err, ErrRefused) {
@@ -220,8 +221,8 @@ func TestPathScopeSortsHandLandingPaths(t *testing.T) {
 			t.Fatalf("%s is CI configuration a host may run: %v", p, err)
 		}
 	}
-	if _, err := PathScope(self, []string{"internal/supervise/new.go"}); !errors.Is(err, ErrRefused) {
-		t.Fatalf("a new supervision file may be proposed: %v", err)
+	if hand, err := PathScope(self, []string{"internal/supervise/new.go"}); err != nil || len(hand) != 0 {
+		t.Fatalf("a new supervision file: %v %v", hand, err)
 	}
 	if hand, err := PathScope(Target{Repo: "agent-sh/fake"}, []string{"internal/loop/gate.go", "go.mod"}); err != nil || len(hand) != 0 {
 		t.Fatalf("another repository's paths: %v %v", hand, err)
@@ -768,14 +769,14 @@ func TestLandRechecksTheChangedPaths(t *testing.T) {
 	if err := s.save(&p); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "never its to land") {
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "outside the loop's explicit self-change allow-list") {
 		t.Fatalf("landed a path outside the allow-list: %v", err)
 	}
 	p.State, p.LandingHead = Landing, p.Head
 	if err := s.save(&p); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "never its to land") {
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "outside the loop's explicit self-change allow-list") {
 		t.Fatalf("resumed the landing of a path outside the allow-list: %v", err)
 	}
 }

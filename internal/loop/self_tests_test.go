@@ -44,8 +44,8 @@ func selfFixtureWith(t *testing.T, more map[string]string) (*Ship, *store.Store,
 	return s, st, f, c, p
 }
 
-// The loop lands a change to the supervision rules together with their test file when the change to the test only
-// appends tests: the package has no hand path, and it lands, both files with it.
+// The loop lands a change to the supervision rules together with their tests: the package has no hand path, and it
+// lands, both files with it.
 func TestARulesChangeWithAppendedTestsIsTheLoopsToLand(t *testing.T) {
 	ctx := context.Background()
 	s, _, f, c, p := selfFixture(t)
@@ -55,8 +55,7 @@ func TestARulesChangeWithAppendedTestsIsTheLoopsToLand(t *testing.T) {
 	if err != nil || p.State != Checked || len(p.Hand) != 0 || !slices.Equal(p.Changed, []string{rulesPath, rulesTestPath}) {
 		t.Fatalf("a rules change with an appended test: hand %v changed %v state %s: %v", p.Hand, p.Changed, p.State, err)
 	}
-	// by its name the test file is still a person's: only the read of its change lets it through
-	if err := CheckPaths(Target{Repo: SelfRepo}, p.Changed); !errors.Is(err, ErrRefused) {
+	if err := CheckPaths(Target{Repo: SelfRepo}, p.Changed); err != nil {
 		t.Fatalf("the gate's check by names: %v", err)
 	}
 	if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "The limit is two", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
@@ -75,9 +74,9 @@ func TestARulesChangeWithAppendedTestsIsTheLoopsToLand(t *testing.T) {
 	}
 }
 
-// What a change does to the loop's own files decides whose it is to land, where the paths cannot: a test file's
-// change that is no append of tests stays a person's, a rules file's change that does more than change a rule
-// becomes one, and in another repository nothing is read.
+// What a change does to the loop's own files decides whose it is to land, where the paths cannot: a change that takes
+// a check away (a skip, a TestMain, a test file deleted) or reaches past what its package could do (a process it
+// starts, a linked name) is a person's, and in another repository nothing is read.
 func TestTheLoopReadsAChangeToItsOwnFiles(t *testing.T) {
 	ctx := context.Background()
 	two := strings.Replace(selfRules, "limit = 1", "limit = 2", 1)
@@ -88,17 +87,18 @@ func TestTheLoopReadsAChangeToItsOwnFiles(t *testing.T) {
 	}{
 		"appended tests":                  {two, selfRulesTest + selfNewTest, 0o644, nil},
 		"the rules alone":                 {two, selfRulesTest, 0o644, nil},
-		"the test alone":                  {selfRules, selfRulesTest + selfNewTest, 0o644, []string{rulesTestPath}},
-		"a variable that runs code":       {two + "\nvar _ = func() bool { limit = 9; return true }()\n", selfRulesTest + selfNewTest, 0o644, []string{rulesPath}},
-		"a line of an old test rewritten": {two, strings.Replace(selfRulesTest, "Limit() <= 0", "Limit() < -5", 1) + selfNewTest, 0o644, []string{rulesTestPath}},
+		"the test alone":                  {selfRules, selfRulesTest + selfNewTest, 0o644, nil},
+		"a variable that runs code":       {two + "\nvar _ = func() bool { limit = 9; return true }()\n", selfRulesTest + selfNewTest, 0o644, nil},
+		"a line of an old test rewritten": {two, strings.Replace(selfRulesTest, "Limit() <= 0", "Limit() < -5", 1) + selfNewTest, 0o644, nil},
 		"a skip put inside an old test":   {two, strings.Replace(selfRulesTest, "\tif Limit", "\tt.Skip()\n\tif Limit", 1) + selfNewTest, 0o644, []string{rulesTestPath}},
 		"a TestMain appended":             {two, selfRulesTest + selfNewTest + "\nfunc TestMain(m *testing.M) {}\n", 0o644, []string{rulesTestPath}},
 		"the test file made executable":   {two, selfRulesTest + selfNewTest, 0o755, []string{rulesTestPath}},
 		"the test file deleted":           {two, "", 0o644, []string{rulesTestPath}},
-		"an import added to the rules":    {strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os\"\n)\n\nvar _ = os.Args", 1), selfRulesTest + selfNewTest, 0o644, []string{rulesPath}},
-		"an initializer in the rules":     {two + "\nfunc init() { limit = 3 }\n", selfRulesTest, 0o644, []string{rulesPath}},
-		"the rules deleted":               {"", selfRulesTest + selfNewTest, 0o644, []string{rulesPath}},
-		"both":                            {two + "\nfunc init() {}\n", selfRulesTest + "\nvar x = 1\n", 0o644, []string{rulesPath, rulesTestPath}},
+		"a standard import in the rules":  {strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os\"\n)\n\nvar _ = os.Args", 1), selfRulesTest + selfNewTest, 0o644, nil},
+		"a process started by the rules":  {strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os/exec\"\n)\n\nvar _ = exec.Command", 1), selfRulesTest + selfNewTest, 0o644, []string{rulesPath}},
+		"an initializer in the rules":     {two + "\nfunc init() { limit = 3 }\n", selfRulesTest, 0o644, nil},
+		"the rules deleted":               {"", selfRulesTest + selfNewTest, 0o644, nil},
+		"both":                            {two + "\n//go:linkname x runtime.x\n", selfRulesTest + "\nfunc TestMain(m *testing.M) {}\n", 0o644, []string{rulesPath, rulesTestPath}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, _, _, cs, p := selfFixture(t)
@@ -140,27 +140,6 @@ func TestTheLoopReadsAChangeToItsOwnFiles(t *testing.T) {
 			}
 		})
 	}
-	// The loop's tests run last only while the package's other test files leave the order alone. In a package
-	// where one does not, the loop's test file is a person's again, though its change only appends.
-	for name, more := range map[string]map[string]string{
-		"a test file that sorts after the loop's": {"internal/supervise/zzz_later_test.go": selfOther},
-		"a test file whose name git would quote":  {"internal/supervise/zzé_test.go": selfOther},
-		"a test that runs in parallel":            {"internal/supervise/par_test.go": "package supervise\n\nimport \"testing\"\n\nfunc TestPar(t *testing.T) { t.Parallel() }\n"},
-		"a file of the external test package":     {"internal/supervise/ext_test.go": "package supervise_test\n\nimport \"testing\"\n\nfunc TestExt(t *testing.T) {}\n"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			s, _, _, cs, p := selfFixtureWith(t, more)
-			write(t, filepath.Join(p.Work, rulesPath), two)
-			write(t, filepath.Join(p.Work, rulesTestPath), selfRulesTest+selfNewTest)
-			tree, paths, err := s.applyPatch(ctx, p, []Patch{fixturePatch(t, s, cs.ID)})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if hand, err := s.selfScope(ctx, p, p.BaseCommit, tree, paths, []string{rulesTestPath}); err != nil || !slices.Equal(hand, []string{rulesTestPath}) {
-				t.Fatalf("hand paths %v: %v", hand, err)
-			}
-		})
-	}
 }
 
 // The host runs the whole suite of the rules' package on the change. A change whose own test passes and that breaks
@@ -186,7 +165,7 @@ func TestTheRulesPackagesOwnTestsMustStillPass(t *testing.T) {
 			write(t, filepath.Join(p.Work, rulesPath), c.rules)
 			write(t, filepath.Join(p.Work, rulesTestPath), selfRulesTest+c.added)
 			p, err := s.CheckArgs(ctx, cs.ID, c.args, nil, fixturePatch(t, s, cs.ID))
-			if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "own tests do not pass") || p.State == Checked {
+			if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "do not pass") || p.State == Checked {
 				t.Fatalf("want the suite's refusal: state %s: %v", p.State, err)
 			}
 		})
@@ -213,19 +192,19 @@ func TestARebasedRulesChangeIsReadAndRunAgain(t *testing.T) {
 	pushOther(t, f, "main", map[string]string{"internal/supervise/y_new_test.go": "package supervise\n\nimport \"testing\"\n\nfunc TestLimitIsOne(t *testing.T) {\n\tif Limit() != 1 {\n\t\tt.Fatal(Limit())\n\t}\n}\n"})
 	base := originHead(t, f, "main")
 	s.Live = true
-	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "own tests do not pass") || originHead(t, f, "main") != base {
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "do not pass") || originHead(t, f, "main") != base {
 		t.Fatalf("a rebased change that breaks the base's test: %v", err)
 	}
 }
 
 // The landing reads the change again, whatever the package says of its hand paths: a package saved with none over a
-// change that rewrites an old test does not land, started or resumed, and the read after a rebase refuses it too.
+// change that puts a skip in an old test does not land, started or resumed, and the read after a rebase refuses it too.
 func TestALandingReadsTheChangeAgain(t *testing.T) {
 	ctx := context.Background()
 	for _, state := range []string{Proposed, Landing} {
 		s, _, f, c, p := selfFixture(t)
 		write(t, filepath.Join(p.Work, rulesPath), strings.Replace(selfRules, "limit = 1", "limit = 2", 1))
-		write(t, filepath.Join(p.Work, rulesTestPath), strings.Replace(selfRulesTest, "Limit() <= 0", "Limit() < -5", 1)+selfNewTest)
+		write(t, filepath.Join(p.Work, rulesTestPath), strings.Replace(selfRulesTest, "\tif Limit", "\tt.Skip()\n\tif Limit", 1)+selfNewTest)
 		p, err := s.CheckArgs(ctx, c.ID, []string{"go", "test", "./..."}, nil, fixturePatch(t, s, c.ID))
 		if err != nil || !slices.Equal(p.Hand, []string{rulesTestPath}) {
 			t.Fatalf("setup: a hand landing: %v %v", p.Hand, err)
@@ -259,29 +238,5 @@ func TestALandingReadsTheChangeAgain(t *testing.T) {
 		if err := s.selfLanding(ctx, p, p.Head); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), rulesTestPath) {
 			t.Fatalf("the read after a rebase: %v", err)
 		}
-	}
-}
-
-// The read after a rebase is of the rebased change on the base it now stands on: a base that gained, since the
-// review, a test that runs in parallel makes the loop's test file a person's, and nothing lands.
-func TestARebasedChangeIsReadOnItsNewBase(t *testing.T) {
-	ctx := context.Background()
-	s, _, f, c, p := selfFixture(t)
-	write(t, filepath.Join(p.Work, rulesPath), strings.Replace(selfRules, "limit = 1", "limit = 2", 1))
-	write(t, filepath.Join(p.Work, rulesTestPath), selfRulesTest+selfNewTest)
-	if _, err := s.CheckArgs(ctx, c.ID, []string{"go", "test", "-run", "TestLimitIsTwo", "./..."}, nil, fixturePatch(t, s, c.ID)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "The limit is two", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
-		t.Fatal(err)
-	}
-	if p, err := s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
-		t.Fatalf("a clean review: %+v %v", p, err)
-	}
-	pushOther(t, f, "main", map[string]string{"internal/supervise/par_test.go": "package supervise\n\nimport \"testing\"\n\nfunc TestPar(t *testing.T) { t.Parallel() }\n"})
-	base := originHead(t, f, "main")
-	s.Live = true
-	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), rulesTestPath) || originHead(t, f, "main") != base {
-		t.Fatalf("a base that gained a parallel test: %v", err)
 	}
 }

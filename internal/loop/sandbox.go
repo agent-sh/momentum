@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/agent-sh/momentum/internal/sandbox"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/agent-sh/momentum/internal/sandbox"
 )
 
 // testPrograms are the programs a check may run as its test: the test runners of the languages the owned
@@ -266,16 +268,23 @@ func (s Sandbox) room(ctx context.Context) error {
 }
 
 func (s Sandbox) Run(ctx context.Context, dir string, words []string, extra []string) (outcome Outcome, runErr error) {
+	outcome, _, runErr = s.RunOut(ctx, dir, words, extra, nil, "", 0)
+	return outcome, runErr
+}
+
+// RunOut is Run with more read-only binds and the file the program wrote under /out by the name keep, read whole
+// up to limit bytes (more is an error): the output of code the host did not write, which the caller reads as data.
+func (s Sandbox) RunOut(ctx context.Context, dir string, words []string, extra []string, binds []sandbox.Bind, keep string, limit int64) (outcome Outcome, kept []byte, runErr error) {
 	if err := s.room(ctx); err != nil {
-		return Outcome{}, err
+		return Outcome{}, nil, err
 	}
 	base := firstOf(s.Scratch, filepath.Dir(dir))
 	if err := os.MkdirAll(base, 0700); err != nil {
-		return Outcome{}, err
+		return Outcome{}, nil, err
 	}
 	scratch, err := os.MkdirTemp(base, ".check-")
 	if err != nil {
-		return Outcome{}, err
+		return Outcome{}, nil, err
 	}
 	defer func() {
 		if err := removeAll(scratch); err != nil {
@@ -283,12 +292,13 @@ func (s Sandbox) Run(ctx context.Context, dir string, words []string, extra []st
 		}
 	}()
 	if err := os.Mkdir(filepath.Join(scratch, "out"), 0700); err != nil {
-		return Outcome{}, err
+		return Outcome{}, nil, err
 	}
 	spec, err := s.spec(dir, scratch, words, extra)
 	if err != nil {
-		return Outcome{}, err
+		return Outcome{}, nil, err
 	}
+	spec.Binds = append(spec.Binds, binds...)
 	timeout := s.Timeout
 	if timeout <= 0 {
 		timeout = DefaultTestTimeout
@@ -302,22 +312,53 @@ func (s Sandbox) Run(ctx context.Context, dir string, words []string, extra []st
 	// host's: the check refuses it, so the build sees why. A pass that ends, or a sandbox that cannot stop the test,
 	// is still the host's.
 	if err != nil && ctx.Err() == nil && errors.Is(cctx.Err(), context.DeadlineExceeded) && !result.Failed {
-		return Outcome{}, refused("the test ran past the check's time limit (%s): a test must end, failing or passing, within it", timeout)
+		return Outcome{}, nil, refused("the test ran past the check's time limit (%s): a test must end, failing or passing, within it", timeout)
 	}
 	if err != nil {
-		return Outcome{}, err
+		return Outcome{}, nil, err
 	}
 	if out.Over() {
-		return Outcome{}, refused("the test printed past the check's output limit (%d MiB): a test must print less", MaxStream>>20)
+		return Outcome{}, nil, refused("the test printed past the check's output limit (%d MiB): a test must print less", MaxStream>>20)
 	}
 	if result.Failed {
-		return Outcome{}, errors.New("test launcher failed")
+		return Outcome{}, nil, errors.New("test launcher failed")
 	}
 	clean, err := Redact(ctx, out.String())
 	if err != nil {
-		return Outcome{}, err
+		return Outcome{}, nil, err
 	}
-	return Outcome{Exit: result.Code, Seconds: time.Since(start).Seconds(), Tail: tailOf([]byte(clean), 1500)}, nil
+	outcome = Outcome{Exit: result.Code, Seconds: time.Since(start).Seconds(), Tail: tailOf([]byte(clean), 1500)}
+	if keep == "" || outcome.Exit != 0 {
+		return outcome, nil, nil
+	}
+	kept, err = readKept(filepath.Join(scratch, "out"), keep, limit)
+	return outcome, kept, err
+}
+
+// readKept reads one regular file a run wrote under its out directory, through a confined root, at most limit bytes.
+func readKept(dir, name string, limit int64) ([]byte, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	info, err := root.Lstat(name)
+	if err != nil {
+		return nil, fmt.Errorf("the run wrote no %s: %w", name, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > limit {
+		return nil, refused("the run's %s is no regular file of at most %d bytes", name, limit)
+	}
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err == nil && int64(len(b)) > limit {
+		err = refused("the run's %s is over %d bytes", name, limit)
+	}
+	return b, err
 }
 
 func tailOf(b []byte, n int) string {

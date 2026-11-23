@@ -62,6 +62,9 @@ type Ship struct {
 	ConfigTargets ConfigTargets
 	// Wait is a test hook for the pause between two reads of a commit's checks (landingCI): a timer when nil.
 	Wait func(ctx context.Context, d time.Duration) error
+	// ReplayStore is a scrubbed copy of the store a change to the loop's own detectors is replayed over before it
+	// lands (selfReplay): the pass's store copy, while a pass runs. With none, such a change is a person's to land.
+	ReplayStore string
 }
 
 // logf writes a problem that does not stop a step to the ship tool's log, scrubbed; nothing when it cannot be scrubbed.
@@ -201,6 +204,8 @@ type Check struct {
 	Tree         string    `json:"tree"` // the tree it checked: an edit after it needs a new check
 	At           time.Time `json:"at"`
 	CommandInput string    `json:"command_input,omitempty"` // host-only execution data; Test is display text
+	// Replay is what a change to the loop's own detectors does to the keys of the stored history (selfReplay).
+	Replay *SelfReplay `json:"replay,omitempty"`
 }
 
 // Plan is how the change is measured: a signal over the store's events, counted in units of activity over
@@ -870,8 +875,12 @@ func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testF
 	if err != nil {
 		return p, err
 	}
+	var replay *SelfReplay
 	if b.Exit != 0 && a.Exit == 0 && p.Kind != KindConfig {
 		if err := s.selfSuite(ctx, p, tree, paths); err != nil {
+			return p, err
+		}
+		if replay, err = s.selfReplay(ctx, p, tree, paths, hand); err != nil {
 			return p, err
 		}
 	}
@@ -891,7 +900,10 @@ func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testF
 		return p, err
 	}
 	const commandInput = "test-command.json"
-	ck := &Check{Test: display, TestFiles: testFiles, Before: b, After: a, Tree: tree, At: s.now(), CommandInput: commandInput}
+	ck := &Check{Test: display, TestFiles: testFiles, Before: b, After: a, Tree: tree, At: s.now(), CommandInput: commandInput, Replay: replay}
+	if replay != nil {
+		note += "; " + replay.Summary()
+	}
 	if err := writeJSON(filepath.Join(s.pkgDir(caseID), commandInput), checkCommand{Tree: tree, Args: words}); err != nil {
 		return p, err
 	}
@@ -1601,19 +1613,18 @@ func (s *Ship) blob(ctx context.Context, p Package, rev, name string) ([]byte, b
 }
 
 // selfScope reads the content of a change to the loop's own repository, between a base and a tree of the host
-// clone, and settles what the paths alone cannot (PathScope). A rules file whose change does more than change a rule
-// (rulesKept) becomes a hand path. A rules' test file whose change only appends tests (appendedTests) stops being
-// one, while the package's tests still run in the order that puts the loop's last (testsRunLast). Elsewhere the
-// hand paths stand as given.
+// clone, and settles what the paths alone cannot (PathScope): a path the loop lands by its name becomes a hand path
+// when its content does more than the loop lands (selfKept), when it leaves no plain file there, and, for a
+// detector, when no copy of the store is there to replay it over (selfReplay) and the package's check replayed none.
+// Elsewhere the hand paths stand as given.
 func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, changed, hand []string) (out []string, err error) {
 	if !strings.EqualFold(p.Repo, SelfRepo) {
 		return hand, nil
 	}
 	out = slices.Clone(hand)
+	had := map[string]map[string]bool{} // each package's imports at the base, by its directory
 	for _, c := range changed {
-		rules := slices.Contains(selfChanges, c)
-		with, test := selfTests[c]
-		if !rules && !test {
+		if !selfLandable(c) || slices.Contains(out, c) {
 			continue
 		}
 		old, _, err := s.blob(ctx, p, base, c)
@@ -1624,58 +1635,66 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 		if err != nil {
 			return nil, err
 		}
-		why := "the change leaves no plain file there"
+		gone, err := s.absent(ctx, p, tree, c)
+		if err != nil {
+			return nil, err
+		}
+		why := ""
 		switch {
-		case !plainNow:
-		case rules:
-			why = rulesKept(old, now)
-		case !slices.Contains(changed, with):
-			why = "its rules file is not in the change: a test lands with the rule it tests"
+		case !plainNow && !gone:
+			why = "the change leaves no plain file there"
+		case isReplayed(c) && s.ReplayStore == "" && (p.Check == nil || p.Check.Replay == nil):
+			why = "no copy of the store is here to replay a detector change over: a loop pass checks it"
 		default:
-			if _, why = appendedTests(old, now); why == "" {
-				if why, err = s.testsRunLast(ctx, p, tree, c); err != nil {
+			dir := path.Dir(c)
+			if had[dir] == nil {
+				if had[dir], err = s.packageImports(ctx, p, base, dir); err != nil {
 					return nil, err
 				}
 			}
+			if gone {
+				now = nil
+			}
+			why = selfKept(c, old, now, had[dir])
 		}
-		switch {
-		case why != "" && !slices.Contains(out, c):
+		if why != "" {
 			out = append(out, c)
-			fallthrough
-		case why != "":
 			s.logf("case %s: %s is a person's to land: %s", p.Case, c, why)
-		case test:
-			out = slices.DeleteFunc(out, func(h string) bool { return h == c })
 		}
 	}
 	slices.Sort(out)
 	return out, nil
 }
 
-// testsRunLast reads the test files of the loop's test file's package in a tree and says why the loop's tests would
-// not run after every other test there (runLast), or "".
-func (s *Ship) testsRunLast(ctx context.Context, p Package, tree, own string) (string, error) {
-	// names end with a NUL (-z): git quotes a name with a byte it does not print, and a quoted name would not read
-	// as a test file's
-	list, err := s.git(ctx, p.Host, "ls-tree", "-z", "--name-only", tree, "--", path.Dir(own)+"/")
+// absent says whether a tree holds nothing at a path.
+func (s *Ship) absent(ctx context.Context, p Package, rev, name string) (bool, error) {
+	entry, err := s.git(ctx, p.Host, "ls-tree", rev, "--", name)
+	return strings.TrimSpace(entry) == "", err
+}
+
+// packageImports are the imports of the Go files a directory holds at a revision.
+func (s *Ship) packageImports(ctx context.Context, p Package, rev, dir string) (map[string]bool, error) {
+	// names end with a NUL (-z): git quotes a name with a byte it does not print
+	list, err := s.git(ctx, p.Host, "ls-tree", "-z", "--name-only", rev, "--", dir+"/")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	files := map[string][]byte{}
+	out := map[string]bool{}
 	for _, name := range strings.Split(list, "\x00") {
-		if !strings.HasSuffix(name, "_test.go") {
+		if !strings.HasSuffix(name, ".go") {
 			continue
 		}
-		b, plainFile, err := s.blob(ctx, p, tree, name)
+		b, plainFile, err := s.blob(ctx, p, rev, name)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		if !plainFile {
-			return name + " is no plain file", nil
+		if plainFile {
+			for _, i := range fileImports(b) {
+				out[i] = true
+			}
 		}
-		files[path.Base(name)] = b
 	}
-	return runLast(files, path.Base(own)), nil
+	return out, nil
 }
 
 // landPaths is the landing's check of a package's paths: the gate's, with the content of a change to the loop's own
@@ -1691,14 +1710,14 @@ func (s *Ship) landPaths(ctx context.Context, p Package, base, head string) erro
 	if err := CheckPaths(Target{Repo: p.Repo}, hand); err != nil {
 		return err
 	}
-	return refused("%s: the change does more there than the loop lands (a rule's change with no new import, initializer or directive)", strings.Join(hand, ", "))
+	return refused("%s: the change does more there than the loop lands (an import its package lacks, a directive, a test taken away or skipped)", strings.Join(hand, ", "))
 }
 
-// selfSuite runs, for a change to the loop's own rules or their tests, the whole test suite of each package it
-// touches there, in the sandbox: the build's own command may name one test, and the tests the package had must
-// pass with the change. The tests the change adds run last (runLast), so they change nothing the others see. It
-// runs on an export of rev made for it: the build's own test command writes where it runs, and a suite run there
-// would prove nothing.
+// selfSuite runs, for a change to the loop's own repository, the whole test suite of each Go package the change
+// touches there, and vets the whole module, in the sandbox: the build's own command may name one test, the tests
+// each package had must pass with the change, and a package that imports a changed one must still build with its
+// tests. It runs on an export of rev made for it: the build's own test command writes where it runs, and a suite run
+// there would prove nothing.
 func (s *Ship) selfSuite(ctx context.Context, p Package, rev string, changed []string) error {
 	if !strings.EqualFold(p.Repo, SelfRepo) {
 		return nil
@@ -1706,7 +1725,7 @@ func (s *Ship) selfSuite(ctx context.Context, p Package, rev string, changed []s
 	cmd := []string{"go", "test", "-count=1"}
 	n := len(cmd)
 	for _, c := range changed {
-		if pkg := "./" + path.Dir(c); (slices.Contains(selfChanges, c) || selfTests[c] != "") && !slices.Contains(cmd[n:], pkg) {
+		if pkg := "./" + path.Dir(c); strings.HasSuffix(c, ".go") && selfLandable(c) && !slices.Contains(cmd[n:], pkg) {
 			cmd = append(cmd, pkg)
 		}
 	}
@@ -1720,14 +1739,16 @@ func (s *Ship) selfSuite(ctx context.Context, p Package, rev string, changed []s
 	if err != nil {
 		return err
 	}
-	o, err := s.Sandbox.Run(ctx, dir, cmd, s.Env)
-	if err = errors.Join(err, s.unexport(p, dir)); err != nil {
-		return err
+	for _, words := range [][]string{{"go", "vet", "./..."}, cmd} {
+		o, err := s.Sandbox.Run(ctx, dir, words, s.Env)
+		if err != nil {
+			return errors.Join(err, s.unexport(p, dir))
+		}
+		if o.Exit != 0 {
+			return errors.Join(refused("the module's own checks do not pass with the change (%s: exit %d): a change keeps the tests it found passing, and every package building", strings.Join(words, " "), o.Exit), s.unexport(p, dir))
+		}
 	}
-	if o.Exit != 0 {
-		return refused("the package's own tests do not pass with the change (%s: exit %d): a change keeps the tests it found passing", strings.Join(cmd, " "), o.Exit)
-	}
-	return nil
+	return s.unexport(p, dir)
 }
 
 // selfLanding reads a rebased change to the loop's own repository as the check read the reviewed one: against the

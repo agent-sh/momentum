@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -223,29 +222,68 @@ func (g Gate) scope(ctx context.Context, repo, dir string) error {
 	return refused("the scope check does not allow %s (%s %s): report only", repo, v.Disposition, why)
 }
 
-// Protected are the paths of momentum's own repository the loop never changes: what its judgment and its
-// authority rest on. Its detectors and the events they read (the store, the sources that fill it, the masks), its
-// measurement, its gates, skills and runner, its commands (the git and replay guards among them), its
-// configuration, its build (go.mod, go.sum, CI) and its contract (SPEC, AGENTS). A change there is its
-// evaluator's or its authority's, which only the owner or a session he directs makes. Each call returns a list
-// of its own: nothing a change compiles in can empty it.
-func Protected() []string {
-	return []string{"internal/", "cmd/", "sessions/", ".github/"}
+// Protected are the paths of momentum's own repository that its judgment and its authority rest on (ProposalProtected):
+// CheckPaths names a hand path among them as the loop's own. Each call returns a list of its own: nothing a change
+// compiles in can empty it.
+func Protected() []string { return ProposalProtected() }
+
+// selfLand are the paths of the loop's own repository it lands itself, behind the gates every change passes (its
+// check, the full suite of each package it touches, its review, CI) and the reads of its content (selfKept) and, for a
+// detector, of what it does to the stored history (selfReplay): a directory, with its final slash, or a file. Each
+// file's test file lands with it. The parts of them selfHand names are a person's. What is not here is a person's to
+// land (Hand landing), and ProposalProtected no change touches at all.
+var selfLand = []string{
+	"internal/detect/",           // the detectors: a change is replayed over the stored history before it lands
+	"internal/supervise/",        // supervision's rules and engine
+	"internal/evidenceview/",     // how an event's record is shown
+	"internal/request/",          // the owner's requests and their follow-ups
+	"sessions/",                  // the live session layer's readers
+	"internal/capacity/rules.go", // the capacity rules a capacity run applies
+	"cmd/momentum/report.go", "cmd/momentum/note.go", "cmd/momentum/output.go", "cmd/momentum/request.go", "cmd/momentum/sessions.go",
+	"README.md",
 }
 
-var selfChanges = []string{"internal/supervise/rules.go", "internal/capacity/rules.go"}
+// selfHand are the parts of selfLand that stay a person's to land: the sessions detector, which reads the transcripts
+// and Hermes's database, so no copy of the store replays it; supervision's history and replay, which the sessions
+// detector reads and which measure the rules; and the one part of the session layer that types into a session,
+// whose checks keep a message from answering a dialog or a permission.
+var selfHand = []string{"internal/detect/sessions.go", "internal/supervise/history.go", "internal/supervise/replay.go", "sessions/act/"}
 
-// selfTests are the test files of the loop's own repository that land with a rules file when their change only
-// appends tests, each with the rules file it lands with. The file is the loop's own, kept apart from the tests a
-// person wrote, and its name sorts last in its package: the go command runs a package's tests file by file in the
-// order of their names, so a test the loop added runs after every test it did not add, and nothing it leaves behind
-// reaches one, while the package's other test files leave that order alone (runLast, read at each step). By their
-// names these are hand paths still (PathScope, CheckPaths): the ship tool reads the change
-// itself (Ship.selfScope) before it lets one through, at the check and again at the landing.
-var selfTests = map[string]string{"internal/supervise/zz_loop_test.go": "internal/supervise/rules.go"}
+// replayed are the landable paths whose change the host replays over the stored history (selfReplay).
+var replayed = []string{"internal/detect/"}
 
-// SelfLandableTests are the test files the loop lands with its rules when their change only appends tests.
-func SelfLandableTests() []string { return slices.Sorted(maps.Keys(selfTests)) }
+// selfLandable says whether the loop lands a change to a path of its own repository itself, by the path: in selfLand,
+// not in selfHand, or the test file of a file selfLand names. The case is the path's as given: a path that differs in
+// case is another path on a disk that tells them apart.
+func selfLandable(c string) bool {
+	for _, p := range selfHand {
+		if inPath(c, p) || strings.HasSuffix(p, ".go") && c == strings.TrimSuffix(p, ".go")+"_test.go" {
+			return false
+		}
+	}
+	if base, ok := strings.CutSuffix(c, "_test.go"); ok && slices.Contains(selfLand, base+".go") {
+		return true
+	}
+	for _, p := range selfLand {
+		if inPath(c, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isReplayed says whether a change to the path is replayed over the stored history before it lands.
+func isReplayed(c string) bool {
+	if !selfLandable(c) {
+		return false
+	}
+	for _, p := range replayed {
+		if inPath(c, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // ciPaths are the CI configurations of the hosts the loop could push to.
 var ciPaths = []string{".github/", ".circleci/", ".buildkite/", ".gitlab-ci.yml", "Jenkinsfile", "azure-pipelines.yml", ".travis.yml"}
@@ -297,7 +335,7 @@ func PathScope(t Target, changed []string) (hand []string, err error) {
 		if proposalProtected(c) {
 			return nil, refused("%s is what the loop's measurement or its event scanners rest on: never its to change, not even for a hand landing", c)
 		}
-		if !slices.Contains(selfChanges, c) {
+		if !selfLandable(c) {
 			hand = append(hand, c)
 		}
 	}
@@ -317,33 +355,35 @@ func inPath(c, p string) bool {
 // internal/loop/.
 func inPathFold(c, p string) bool { return inPath(strings.ToLower(c), strings.ToLower(p)) }
 
-// SelfLandable are the paths of the loop's own repository it may land itself.
-func SelfLandable() []string { return slices.Clone(selfChanges) }
+// SelfLandable are the paths of the loop's own repository it may land itself (selfLand), and SelfHand the parts of
+// them that stay a person's.
+func SelfLandable() []string { return slices.Clone(selfLand) }
+
+// SelfHand are the parts of SelfLandable that stay a person's to land.
+func SelfHand() []string { return slices.Clone(selfHand) }
 
 // ProposalProtected are the paths of momentum's own repository that no change of the loop's touches, not even a
-// proposal a person lands by hand: what its measurement reads and decides with (the loop, its measurement, its sandbox
-// and the run's read-only reader with its case view, its configuration and paths, its commands), the scanners,
-// sources and detectors that write and judge the events it counts and the text normalization they share (sessions,
-// sources, the store, the scorecard that judges momentum and tacit week by week, tool results, plain text, detectors, internal/supervise/ but its rules and their tests
-// (proposalProtected), the capacity run's files that record its events and reads, and the busy check the ship gate
-// uses, capacity's acts.go), its build (go.mod, go.sum,
-// go.work, go.work.sum, vendor/) and
-// the check CI builds from the tree (internal/tracked). The capacity rules a capacity run applies and the supervision
-// rules stay outside it: they are what the loop fixes. CI configuration is refused in every repository besides
-// (ciPaths). Each call returns a list of its own.
+// proposal a person lands by hand: what its judgment and its authority rest on. The loop (its gates, ship tool,
+// runner, budgets, relay and measure step), its measurement statistics and the replay a detector change is read by,
+// the sandbox, the run's read-only reader, the check CI builds from the tree, its configuration and its paths; the
+// store, whose schema and migrations hold every event and case and whose case store decides which close a case may
+// take; the weekly scorecard that judges momentum and tacit, and internal/weekly/ reserved beside it; the capacity run's events and read records and the busy check the
+// repository gate uses; every command but the few that only print (selfLand), since the commands hold the gates,
+// the kill switches (supervise.off, loop.live) and the measure and ship steps; and its build and supply chain (go.mod,
+// go.sum, go.work, go.work.sum, vendor/). CI configuration is refused in every repository besides (ciPaths). A
+// path is compared without case: a checkout on a case-insensitive disk writes Internal/loop/x.go into internal/loop/.
+// Each call returns a list of its own.
 func ProposalProtected() []string {
-	return []string{"cmd/", "sessions/", "internal/loop/", "internal/measure/", "internal/sandbox/", "internal/ro/",
-		"internal/evidenceview/", "internal/config/", "internal/paths/", "internal/detect/", "internal/source/", "internal/store/", "internal/scorecard/",
-		"internal/toolresult/", "internal/plain/", "internal/tracked/", "internal/capacity/run.go", "internal/capacity/record.go", "internal/capacity/acts.go", "internal/capacity/scratch_made.go", "internal/capacity/fsid.go",
-		"internal/supervise/", "go.mod", "go.sum", "go.work", "go.work.sum", "vendor/"}
+	return []string{"cmd/", "internal/loop/", "internal/measure/", "internal/sandbox/", "internal/ro/", "internal/tracked/",
+		"internal/config/", "internal/paths/", "internal/store/", "internal/scorecard/", "internal/weekly/",
+		"internal/capacity/run.go", "internal/capacity/record.go", "internal/capacity/acts.go", "internal/capacity/scratch_made.go", "internal/capacity/fsid.go",
+		"go.mod", "go.sum", "go.work", "go.work.sum", "vendor/"}
 }
 
-// proposalProtected says whether a path of momentum's own repository is in ProposalProtected. Of internal/supervise/
-// only rules.go and test files stay outside it: supervision's rules are what the loop fixes, and their test lives
-// beside them, while every other file there, a new one too, feeds the supervision run's events or the sessions
-// detector.
+// proposalProtected says whether a path of momentum's own repository is in ProposalProtected, and not one the loop
+// lands (the commands that only print).
 func proposalProtected(c string) bool {
-	if lower := strings.ToLower(c); strings.HasPrefix(lower, "internal/supervise/") && (c == "internal/supervise/rules.go" || strings.HasSuffix(c, "_test.go")) {
+	if selfLandable(c) {
 		return false
 	}
 	for _, p := range ProposalProtected() {

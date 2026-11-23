@@ -47,7 +47,18 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 	if r == (Recur{}) {
 		r = FailuresRecur
 	}
-	var occ []occurrence
+	occ, inc, err := f.sightings(ctx, st, w)
+	out := gather("failures", occ, r)
+	if inc != nil {
+		out = append(out, gather("failures", inc, IncidentRecur)...)
+	}
+	return out, err
+}
+
+// sightings are the failures' occurrences over a window, before any threshold: the transcripts' and the mistakes
+// log's, and the incidents' (inc, nil when the run stopped before them). A run that fails partway returns what it
+// found with its error.
+func (f Failures) sightings(ctx context.Context, st *store.Store, w Window) (occ, inc []occurrence, err error) {
 	// the transcript's failed results by session and tool, in time: a mistakes row is the same sighting as one of
 	// them of its session and tool within a few seconds, whatever the text each keeps of it
 	type seen struct {
@@ -71,7 +82,7 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		results, err := st.Events(ctx, store.Query{Since: w.Since, Until: w.Until, Kinds: []string{"tool_result"},
 			Source: store.Transcripts, Limit: resultPage, Before: before})
 		if err != nil {
-			return gather("failures", occ, r), err
+			return occ, nil, err
 		}
 		var candidates, writes, ran []store.Event
 		for _, e := range results {
@@ -95,7 +106,7 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		}
 		calls, err := st.CallsOf(ctx, slices.Concat(candidates, writes, ran), callReach)
 		if err != nil {
-			return gather("failures", occ, r), err
+			return occ, nil, err
 		}
 		for _, e := range slices.Concat(writes, ran) {
 			th := thread{e.Session, e.Agent, e.Tool}
@@ -173,7 +184,7 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 	mistakes, err := st.Events(ctx, store.Query{Since: w.Since, Until: w.Until, Source: "mistakes",
 		Kinds: []string{"tool-error", "deny", "held", "refusal", "turn-error"}, Limit: maxRows})
 	if err != nil {
-		return gather("failures", occ, r), err
+		return occ, nil, err
 	}
 	for _, e := range mistakes {
 		if e.Tool != "" && same(e.Session, e.Tool, e.TS) {
@@ -187,9 +198,11 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		}
 		occ = append(occ, occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e})
 	}
-	out := gather("failures", occ, r)
-	inc, err := incidentSightings(ctx, st, w)
-	return append(out, gather("failures", inc, IncidentRecur)...), err
+	inc, err = incidentSightings(ctx, st, w)
+	if inc == nil {
+		inc = []occurrence{}
+	}
+	return occ, inc, err
 }
 
 // heedSpan is how long after a guard's refusal its thread's next call of the tool heeds it. An agent that reads a

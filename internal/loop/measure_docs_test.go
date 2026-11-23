@@ -35,7 +35,7 @@ func TestMeasurementDocsStateTheReadAndInEffectRules(t *testing.T) {
 		"is not the file's and is not kept",
 		"lies in a directory of `loop.read_dirs`, which a run cannot write, and not in the build's work tree",
 		"The step opens the file once, without following a last link and without waiting on a pipe",
-		"the session scanners that write the sessions events",
+		"which no replay over stored events shows: a change could make failure events disappear unseen",
 		"a proposal refused for it is a wait, recorded with its plan and signal",
 		"the problem is too new to measure with that window",
 		"A reader is dated by its first event, so one switched off and on again is not caught",

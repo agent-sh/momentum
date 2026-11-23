@@ -1,0 +1,117 @@
+package loop
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/agent-sh/momentum/internal/detect"
+	"github.com/agent-sh/momentum/internal/measure/rekey"
+	"github.com/agent-sh/momentum/internal/plain"
+	"github.com/agent-sh/momentum/internal/sandbox"
+)
+
+// SelfReplay is what a change to the loop's own detectors does to the stored history: the window replayed and how
+// the change keys the events the detectors key there, against its base (rekey.Diff). The package keeps it, so the
+// measure step can tell a problem that stopped from one the detector keys otherwise now.
+type SelfReplay struct {
+	Since time.Time  `json:"since"`
+	Until time.Time  `json:"until"`
+	Diff  rekey.Diff `json:"diff"`
+	// Own are the case's signatures at the check: the events the change may drop are theirs alone.
+	Own []string `json:"own,omitempty"`
+}
+
+// Summary is the replay in counts, for the case's log, the check's note and the review: no signature's text, which
+// comes from the store.
+func (r SelfReplay) Summary() string {
+	d := r.Diff
+	return fmt.Sprintf("detector replay over %s to %s: %d events keyed before, %d after; %d re-keyed under %d other signatures, %d dropped of %d signatures, %d added",
+		r.Since.UTC().Format(time.DateOnly), r.Until.UTC().Format(time.DateOnly), d.Before, d.After, rekey.Moved(d.Rekeyed), len(d.Rekeyed),
+		rekey.Events(d.Dropped), len(d.Dropped), rekey.Events(d.Added))
+}
+
+// ReplayWindow is how much stored history a detector change is replayed over: the window a detectors' run reads,
+// up to the end of the store's copy.
+const ReplayWindow = detect.DefaultWindow
+
+// replayDst is where a replay reads the store's copy in its sandbox.
+const replayDst = "/ro/replay/store.sqlite"
+
+// replayCmd is the replay a detector change is read by: the loop's own replay program (internal/measure/rekey/replay,
+// which no change touches), built from each tree, so each tree's detectors key the same copy of the store.
+func replayCmd(since, until time.Time) []string {
+	return []string{"go", "run", "./internal/measure/rekey/replay", "-store", replayDst,
+		"-since", since.UTC().Format(time.RFC3339Nano), "-until", until.UTC().Format(time.RFC3339Nano), "-out", "/out/keys.jsonl"}
+}
+
+// selfReplay reads a change to the loop's own detectors by the stored history before it may land: it keys the last
+// ReplayWindow of the store's copy (ReplayStore) with the base's detectors and with the change's, in the sandbox,
+// and compares the two (rekey.Compare). A change may key events otherwise (the replay records it), and may stop
+// keying events of the case it fixes, whose own investigation says they are no failures; a change that stops keying
+// events of any other signature makes failures disappear with no evidence that they were false positives, and is
+// refused. A change with no detector path among the paths the loop lands, or in another repository, replays nothing.
+func (s *Ship) selfReplay(ctx context.Context, p Package, tree string, changed, hand []string) (*SelfReplay, error) {
+	if !strings.EqualFold(p.Repo, SelfRepo) || !slices.ContainsFunc(changed, func(c string) bool { return isReplayed(c) && !slices.Contains(hand, c) }) {
+		return nil, nil
+	}
+	if s.ReplayStore == "" {
+		return nil, refused("a change to the loop's own detectors is replayed over a copy of the store, and none is here: a loop pass checks it")
+	}
+	src, err := filepath.EvalSymlinks(s.ReplayStore)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(src)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("the replay's store copy is no regular file")
+	}
+	c, err := s.Store.CaseByID(ctx, p.Case)
+	if err != nil {
+		return nil, err
+	}
+	until := info.ModTime()
+	if now := s.now(); until.After(now) {
+		until = now
+	}
+	since := until.Add(-ReplayWindow)
+	binds := []sandbox.Bind{{Src: src, Dst: replayDst}}
+	keys := make([]map[string]string, 2)
+	for i, rev := range []string{p.BaseCommit, tree} {
+		dir, err := s.export(ctx, p, fmt.Sprintf("replay-%d", i), rev)
+		if err != nil {
+			return nil, err
+		}
+		o, out, err := s.Sandbox.RunOut(ctx, dir, replayCmd(since, until), s.Env, binds, "keys.jsonl", rekey.MaxOutput)
+		err = errors.Join(err, s.unexport(p, dir))
+		if err != nil {
+			return nil, err
+		}
+		if o.Exit != 0 {
+			side := map[int]string{0: "the base", 1: "the change"}[i]
+			return nil, refused("the detector replay did not run on %s (exit %d): a change to the detectors keeps internal/measure/rekey/replay building and running", side, o.Exit)
+		}
+		h, k, err := rekey.Read(out)
+		if err != nil {
+			return nil, refused("the detector replay's output on the change cannot be read: %v", err)
+		}
+		if !h.Since.Equal(since) || !h.Until.Equal(until) {
+			return nil, refused("the detector replay keyed another window than it was given")
+		}
+		keys[i] = k
+	}
+	r := &SelfReplay{Since: since, Until: until, Diff: rekey.Compare(keys[0], keys[1]), Own: slices.Clone(c.Signatures)}
+	if foreign := r.Diff.Foreign(c.Signatures); len(foreign) > 0 {
+		return r, refused("the change stops keying %d stored events of %d signatures its case does not hold (the most, %d events: %s): a detector change makes failures disappear only for the case it fixes, whose investigation says they are none; %s",
+			rekey.Events(foreign), len(foreign), foreign[0].N, plain.Clip(foreign[0].Signature, 160), r.Summary())
+	}
+	return r, nil
+}
