@@ -88,7 +88,7 @@ func TestTheLoopReadsAChangeToItsOwnFiles(t *testing.T) {
 		"appended tests":                  {two, selfRulesTest + selfNewTest, 0o644, nil},
 		"the rules alone":                 {two, selfRulesTest, 0o644, nil},
 		"the test alone":                  {selfRules, selfRulesTest + selfNewTest, 0o644, nil},
-		"a variable that runs code":       {two + "\nvar _ = func() bool { limit = 9; return true }()\n", selfRulesTest + selfNewTest, 0o644, nil},
+		"a variable that runs code":       {two + "\nvar _ = func() bool { limit = 9; return true }()\n", selfRulesTest + selfNewTest, 0o644, []string{rulesPath}},
 		"a line of an old test rewritten": {two, strings.Replace(selfRulesTest, "Limit() <= 0", "Limit() < -5", 1) + selfNewTest, 0o644, nil},
 		"a skip put inside an old test":   {two, strings.Replace(selfRulesTest, "\tif Limit", "\tt.Skip()\n\tif Limit", 1) + selfNewTest, 0o644, []string{rulesTestPath}},
 		"a TestMain appended":             {two, selfRulesTest + selfNewTest + "\nfunc TestMain(m *testing.M) {}\n", 0o644, []string{rulesTestPath}},
@@ -96,7 +96,7 @@ func TestTheLoopReadsAChangeToItsOwnFiles(t *testing.T) {
 		"the test file deleted":           {two, "", 0o644, []string{rulesTestPath}},
 		"a standard import in the rules":  {strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os\"\n)\n\nvar _ = os.Args", 1), selfRulesTest + selfNewTest, 0o644, nil},
 		"a process started by the rules":  {strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os/exec\"\n)\n\nvar _ = exec.Command", 1), selfRulesTest + selfNewTest, 0o644, []string{rulesPath}},
-		"an initializer in the rules":     {two + "\nfunc init() { limit = 3 }\n", selfRulesTest, 0o644, nil},
+		"an initializer in the rules":     {two + "\nfunc init() { limit = 3 }\n", selfRulesTest, 0o644, []string{rulesPath}},
 		"the rules deleted":               {"", selfRulesTest + selfNewTest, 0o644, nil},
 		"both":                            {two + "\n//go:linkname x runtime.x\n", selfRulesTest + "\nfunc TestMain(m *testing.M) {}\n", 0o644, []string{rulesPath, rulesTestPath}},
 	} {

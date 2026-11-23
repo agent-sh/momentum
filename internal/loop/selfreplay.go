@@ -23,8 +23,11 @@ type SelfReplay struct {
 	Since time.Time  `json:"since"`
 	Until time.Time  `json:"until"`
 	Diff  rekey.Diff `json:"diff"`
-	// Own are the case's signatures at the check: the events the change may drop are theirs alone.
+	// Own are the case's signatures at the check: the events the change may drop or re-key are theirs alone.
 	Own []string `json:"own,omitempty"`
+	// OwnKept counts the case's own events the change keys as the base does: a change that leaves some of them keyed
+	// so has not moved the case's whole problem, which its measurement then reads.
+	OwnKept int `json:"own_kept"`
 }
 
 // Summary is the replay in counts, for the case's log, the check's note and the review: no signature's text, which
@@ -52,10 +55,10 @@ func replayCmd(since, until time.Time) []string {
 
 // selfReplay reads a change to the loop's own detectors by the stored history before it may land: it keys the last
 // ReplayWindow of the store's copy (ReplayStore) with the base's detectors and with the change's, in the sandbox,
-// and compares the two (rekey.Compare). A change may key events otherwise (the replay records it), and may stop
-// keying events of the case it fixes, whose own investigation says they are no failures; a change that stops keying
-// events of any other signature makes failures disappear with no evidence that they were false positives, and is
-// refused. A change with no detector path among the paths the loop lands, or in another repository, replays nothing.
+// and compares what each tree's detectors file there (the evidence of their findings, after every threshold). A change
+// may key the case's own events otherwise and stop keying them, whose own investigation says they are no failures; a
+// change that re-keys or stops keying events of any other signature would make another case read its problem gone,
+// or failures disappear with no evidence that they were false positives, and is refused. A change with no detector path among the paths the loop lands, or in another repository, replays nothing.
 func (s *Ship) selfReplay(ctx context.Context, p Package, tree string, changed, hand []string) (*SelfReplay, error) {
 	if !strings.EqualFold(p.Repo, SelfRepo) || !slices.ContainsFunc(changed, func(c string) bool { return isReplayed(c) && !slices.Contains(hand, c) }) {
 		return nil, nil
@@ -108,7 +111,12 @@ func (s *Ship) selfReplay(ctx context.Context, p Package, tree string, changed, 
 		}
 		keys[i] = k
 	}
-	r := &SelfReplay{Since: since, Until: until, Diff: rekey.Compare(keys[0], keys[1]), Own: slices.Clone(c.Signatures)}
+	r := &SelfReplay{Since: since, Until: until, Diff: rekey.Compare(keys[0], keys[1]), Own: slices.Clone(c.Signatures),
+		OwnKept: rekey.Kept(keys[0], keys[1], c.Signatures)}
+	if moves := r.Diff.ForeignMoves(c.Signatures); len(moves) > 0 {
+		return r, refused("the change keys %d stored events of %d signatures its case does not hold by other signatures (the most, %d events, from %s): a detector change re-keys only the events of the case it fixes, or another case would read its problem gone; %s",
+			rekey.Moved(moves), len(moves), moves[0].N, plain.Clip(moves[0].From, 160), r.Summary())
+	}
 	if foreign := r.Diff.Foreign(c.Signatures); len(foreign) > 0 {
 		return r, refused("the change stops keying %d stored events of %d signatures its case does not hold (the most, %d events: %s): a detector change makes failures disappear only for the case it fixes, whose investigation says they are none; %s",
 			rekey.Events(foreign), len(foreign), foreign[0].N, plain.Clip(foreign[0].Signature, 160), r.Summary())

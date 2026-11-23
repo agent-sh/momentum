@@ -13,7 +13,7 @@ import (
 )
 
 // replayStandIn stands in for the loop's replay program in a fixture of its repository: it keys the events
-// internal/detect/keys.txt lists ("ID SIGNATURE" a line), as the tree it is built from holds them, and writes them
+// internal/detect/testdata/keys.txt lists ("ID SIGNATURE" a line), as the tree it is built from holds them, and writes them
 // as the replay writes its output. It reads the store's copy, so a bind that did not reach it fails the run.
 const replayStandIn = `package main
 
@@ -33,7 +33,7 @@ func main() {
 	if _, err := os.ReadFile(*st); err != nil {
 		os.Exit(3)
 	}
-	keys, err := os.ReadFile("internal/detect/keys.txt")
+	keys, err := os.ReadFile("internal/detect/testdata/keys.txt")
 	if err != nil {
 		os.Exit(4)
 	}
@@ -54,7 +54,7 @@ func main() {
 const (
 	ownSig   = "failures/v2:tool:read:own"
 	otherSig = "failures/v2:tool:bash:other"
-	keysPath = "internal/detect/keys.txt"
+	keysPath = "internal/detect/testdata/keys.txt"
 	keysBase = "e1 " + ownSig + "\ne2 " + ownSig + "\ne3 " + otherSig + "\n"
 	detectGo = "package detect\n\n// Version is the keying's version.\nfunc Version() int { return 1 }\n"
 	detectT  = "package detect\n\nimport \"testing\"\n\nfunc TestVersionIsTwo(t *testing.T) {\n\tif Version() != 2 {\n\t\tt.Fatal(Version())\n\t}\n}\n"
@@ -100,13 +100,14 @@ func TestADetectorChangeIsReplayedOverTheStoredHistory(t *testing.T) {
 		"its own events keyed otherwise": {"e1 failures/v2:tool:read:own:path\ne2 " + ownSig + "\ne3 " + otherSig + "\n", false, 1, 0},
 		"its own events dropped":         {"e3 " + otherSig + "\n", false, 0, 2},
 		"another case's events dropped":  {"e1 " + ownSig + "\ne2 " + ownSig + "\n", true, 0, 1},
+		"another case's events re-keyed": {"e1 " + ownSig + "\ne2 " + ownSig + "\ne3 failures/v2:tool:bash:moved\n", true, 0, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, cs, p := replayFixture(t)
 			changeKeys(t, p, c.keys)
 			p, err := s.CheckArgs(ctx, cs.ID, []string{"go", "test", "./internal/detect"}, nil, fixturePatch(t, s, cs.ID))
 			if c.refused {
-				if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "stops keying 1 stored events of 1 signatures its case does not hold") || p.State == Checked {
+				if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "1 stored events of 1 signatures its case does not hold") || p.State == Checked {
 					t.Fatalf("want the replay's refusal: state %s: %v", p.State, err)
 				}
 				return

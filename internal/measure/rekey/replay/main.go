@@ -1,5 +1,6 @@
-// Command replay keys a store's events with the detectors of the tree it is built from and writes each keyed event's
-// id and signature (rekey.Write). The loop runs it, in the sandbox, on the base of a change to its own detectors and
+// Command replay runs the replayable detectors of the tree it is built from over a store (detect.Replayable: failures
+// and owner burden) and writes, for each finding, its evidence's event ids with the finding's signature (rekey.Write):
+// what a detectors' run files, after every threshold and filter. The loop runs it, in the sandbox, on the base of a change to its own detectors and
 // on the change, over the same copy of the store, and compares the two (rekey.Compare). It reads the store read-only
 // and writes only its output file.
 package main
@@ -10,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/detect"
@@ -43,19 +45,26 @@ func run(storePath, since, until, out string) error {
 		return err
 	}
 	defer st.Close()
-	keyed, err := detect.KeyedEvents(context.Background(), st, detect.Window{Since: from, Until: to}, detect.Programs{})
-	if err != nil {
-		return err // a replay that keyed part of the window would read as a change that dropped the rest
+	// what the detectors' runs file, after every threshold and filter of theirs: the evidence of each finding
+	var lines []rekey.Line
+	for _, d := range []detect.Detector{detect.Failures{}, detect.OwnerBurden{}} {
+		fs, err := d.Detect(context.Background(), st, detect.Window{Since: from, Until: to})
+		if err != nil {
+			return err // a replay that keyed part of the window would read as a change that dropped the rest
+		}
+		for _, f := range fs {
+			for _, e := range f.Evidence {
+				if id, ok := strings.CutPrefix(e.Ref, "ev:"); ok {
+					lines = append(lines, rekey.Line{ID: id, Signature: f.Signature})
+				}
+			}
+		}
 	}
 	f, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
 	w := bufio.NewWriter(f)
-	lines := make([]rekey.Line, 0, len(keyed))
-	for _, k := range keyed {
-		lines = append(lines, rekey.Line{ID: k.Event.ID(), Signature: k.Signature})
-	}
 	if err := rekey.Write(w, rekey.Header{Since: from, Until: to}, lines); err != nil {
 		f.Close()
 		return err

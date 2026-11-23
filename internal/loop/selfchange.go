@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
+	"path"
 	"regexp"
 	"slices"
 	"strconv"
@@ -46,7 +48,12 @@ func std(path string) bool {
 // (selfLandable) is a person's all the same, or "". old is the file at the base (nil when the change adds it), now
 // the file the change leaves (nil when it deletes it), and had the imports of the package's files at the base. The
 // change keeps the package within what it could do and keeps the checks its tests make:
+//   - it is a Go file that builds on every platform (no _GOOS or _GOARCH in its name), a document or a test's data
+//     under testdata/: an assembly, C or object file, and any other kind of file, reaches past the language;
 //   - it parses, and adds no comment the toolchain reads (a directive, a build constraint);
+//   - outside a test file, it adds no initializer (an init function, or a package variable whose value holds a call or
+//     a function literal), which runs in every process that imports the package, the protected ones among them, and
+//     no package-level name that hides a predeclared one;
 //   - every import it adds is of the loop's own module but the packages no change touches (ProposalProtected), or of
 //     the standard library but riskyImports, unless its package already imports it;
 //   - in a test file, it takes away no test function the file held (deleting the file takes them all), and adds no
@@ -56,6 +63,9 @@ func std(path string) bool {
 // told to rate high a change that makes a test prove less or widens what the loop may touch, land or spend.
 func selfKept(name string, old, now []byte, had map[string]bool) string {
 	test := strings.HasSuffix(name, "_test.go")
+	if why := fileKind(name); why != "" {
+		return why
+	}
 	if !strings.HasSuffix(name, ".go") {
 		return ""
 	}
@@ -113,6 +123,9 @@ func selfKept(name string, old, now []byte, had map[string]bool) string {
 		}
 	}
 	if !test {
+		if more := added(doings(is), doings(was)); len(more) > 0 {
+			return more[0]
+		}
 		return ""
 	}
 	if was != nil {
@@ -172,6 +185,104 @@ func fileImports(src []byte) []string {
 	for _, i := range f.Imports {
 		path, _ := strconv.Unquote(i.Path.Value)
 		out = append(out, path)
+	}
+	return out
+}
+
+// knownOS and knownArch are the GOOS and GOARCH values a file's name can restrict it to (go/build's lists).
+var knownOS = strings.Fields("aix android darwin dragonfly freebsd hurd illumos ios js linux nacl netbsd openbsd plan9 solaris wasip1 windows zos")
+var knownArch = strings.Fields("386 amd64 amd64p32 arm armbe arm64 arm64be loong64 mips mipsle mips64 mips64le mips64p32 mips64p32le ppc ppc64 ppc64le riscv riscv64 s390 s390x sparc sparc64 wasm")
+
+// fileKind says why a file of a landable directory is no kind the loop lands, or "".
+func fileKind(name string) string {
+	base := path.Base(name)
+	switch {
+	case strings.Contains("/"+path.Dir(name)+"/", "/testdata/"):
+		return "" // a test's data, read by the test, never built
+	case strings.HasSuffix(base, ".md"):
+		return ""
+	case !strings.HasSuffix(base, ".go"):
+		return "it is no Go file: an assembly, C, object or other file can reach past the language"
+	}
+	stem := strings.TrimSuffix(strings.TrimSuffix(base, ".go"), "_test")
+	parts := strings.Split(stem, "_")
+	for _, p := range parts[1:] {
+		if slices.Contains(knownOS, p) || slices.Contains(knownArch, p) {
+			return "its name builds it on one platform only, which the check's platform may not run"
+		}
+	}
+	return ""
+}
+
+// doings are what a file's declarations do beyond declaring: its init functions, the package variables whose value
+// runs code, and the package-level names that hide predeclared ones, each as a sentence.
+func doings(f *ast.File) []string {
+	if f == nil {
+		return nil
+	}
+	var out []string
+	inits := 0
+	for _, d := range f.Decls {
+		switch d := d.(type) {
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				switch spec := spec.(type) {
+				case *ast.ValueSpec:
+					for _, n := range spec.Names {
+						if types.Universe.Lookup(n.Name) != nil {
+							out = append(out, "it declares a name that hides a predeclared one: "+n.Name)
+						}
+					}
+					runs := false
+					for _, v := range spec.Values {
+						ast.Inspect(v, func(n ast.Node) bool {
+							switch n.(type) {
+							case *ast.CallExpr, *ast.FuncLit:
+								runs = true
+							}
+							return !runs
+						})
+					}
+					if runs && d.Tok == token.VAR {
+						out = append(out, "it adds a package variable whose value runs code: "+strings.Join(names(spec.Names), ", "))
+					}
+				case *ast.TypeSpec:
+					if types.Universe.Lookup(spec.Name.Name) != nil {
+						out = append(out, "it declares a name that hides a predeclared one: "+spec.Name.Name)
+					}
+				}
+			}
+		case *ast.FuncDecl:
+			if d.Recv != nil {
+				continue
+			}
+			if types.Universe.Lookup(d.Name.Name) != nil {
+				out = append(out, "it declares a name that hides a predeclared one: "+d.Name.Name)
+			}
+			if d.Name.Name == "init" {
+				inits++
+				out = append(out, "it adds an initializer (init function "+strconv.Itoa(inits)+")")
+			}
+		}
+	}
+	return out
+}
+
+func names(ids []*ast.Ident) []string {
+	var out []string
+	for _, i := range ids {
+		out = append(out, i.Name)
+	}
+	return out
+}
+
+// added are the entries of now that was does not hold.
+func added(now, was []string) []string {
+	var out []string
+	for _, n := range now {
+		if !slices.Contains(was, n) {
+			out = append(out, n)
+		}
 	}
 	return out
 }

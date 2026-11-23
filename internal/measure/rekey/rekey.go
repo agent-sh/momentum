@@ -189,6 +189,37 @@ func (d Diff) Foreign(own []string) []Count {
 	return out
 }
 
+// ForeignMoves are the re-keys of signatures that are not among own: events of another case's problem that the change
+// moves away from that case's signature, which the case would read as its problem gone.
+func (d Diff) ForeignMoves(own []string) []Move {
+	mine := map[string]bool{}
+	for _, s := range own {
+		mine[s] = true
+	}
+	var out []Move
+	for _, m := range d.Rekeyed {
+		if !mine[m.From] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// Kept counts the events the change keys by the same signature as the base, of the signatures given.
+func Kept(before, after map[string]string, sigs []string) int {
+	mine := map[string]bool{}
+	for _, s := range sigs {
+		mine[s] = true
+	}
+	n := 0
+	for id, s := range before {
+		if mine[s] && after[id] == s {
+			n++
+		}
+	}
+	return n
+}
+
 // Touches says whether the change re-keys or drops events of any of the signatures: of the case it fixes, its
 // problem would no longer be seen under them because the detector keys it otherwise, not because it stopped.
 func (d Diff) Touches(sigs []string) (rekeyed, dropped int) {

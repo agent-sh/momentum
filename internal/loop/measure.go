@@ -388,7 +388,9 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		}
 	}
 	if c.Status == store.CaseDeployed && p.Check != nil && p.Check.Replay != nil {
-		if rekeyed, dropped := p.Check.Replay.Diff.Touches(c.Signatures); rekeyed+dropped > 0 {
+		// only a change that moved every one of the case's own events: one that left some keyed as they were has not
+		// moved the case's whole problem, and its measurement reads the rest
+		if rekeyed, dropped := p.Check.Replay.Diff.Touches(c.Signatures); rekeyed+dropped > 0 && p.Check.Replay.OwnKept == 0 {
 			return r.detectorFixed(ctx, c, &p, m, rekeyed, dropped, dry)
 		}
 	}

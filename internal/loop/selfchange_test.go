@@ -15,12 +15,12 @@ const (
 	rulesTestPath = "internal/supervise/zz_loop_test.go"
 )
 
-// The loop lands its own detectors, supervision, session readers and printing commands, and nothing its judgment or
-// authority rests on: the parts of those directories a replay over the store cannot read, and the part that types
-// into a session, stay a person's.
+// The loop lands its own detectors, supervision and session readers, and nothing its judgment or authority rests on:
+// the parts of those directories a replay over the store cannot read, the part that types into a session, and what
+// the store builds on stay a person's, compared without case.
 func TestTheLoopLandsAllButWhatItsJudgmentRestsOn(t *testing.T) {
 	for _, c := range []string{"internal/detect/failures.go", "internal/detect/failures_test.go", "internal/detect/new.go", "internal/supervise/engine.go",
-		"internal/supervise/rules_test.go", "internal/supervise/zz_loop_test.go", "internal/evidenceview/view.go", "internal/request/state.go",
+		"internal/supervise/rules_test.go", "internal/supervise/zz_loop_test.go", "internal/request/state.go",
 		"sessions/claude/scan.go", "sessions/new/file.go", "internal/capacity/rules.go", "internal/capacity/rules_test.go",
 		"README.md"} {
 		if !selfLandable(c) || proposalProtected(c) {
@@ -28,7 +28,7 @@ func TestTheLoopLandsAllButWhatItsJudgmentRestsOn(t *testing.T) {
 		}
 	}
 	for _, c := range []string{"internal/detect/sessions.go", "internal/detect/sessions_test.go", "internal/supervise/replay.go", "internal/supervise/history.go",
-		"sessions/act/act.go", "internal/source/transcripts.go", "internal/toolresult/x.go", "internal/plain/plain.go", "internal/capacity/names.go",
+		"sessions/act/act.go", "sessions/Act/x.go", "internal/detect/Sessions.go", "sessions/state/state.go", "sessions/sessions.go", "internal/evidenceview/view.go", "internal/source/transcripts.go", "internal/toolresult/x.go", "internal/plain/plain.go", "internal/capacity/names.go",
 		"SPEC.md", "AGENTS.md", "LICENSE", "Internal/detect/failures.go"} {
 		if selfLandable(c) || proposalProtected(c) {
 			t.Errorf("%s is a person's to land: landable %v, protected %v", c, selfLandable(c), proposalProtected(c))
@@ -59,7 +59,9 @@ func TestALandableFilesChangeKeepsItsPackageAndItsTests(t *testing.T) {
 		why      string
 	}{
 		"a rule's change":                {rulesPath, selfRules, two, had, ""},
-		"an initializer":                 {rulesPath, selfRules, two + "\nfunc init() { limit = 3 }\n", had, ""},
+		"an initializer":                 {rulesPath, selfRules, two + "\nfunc init() { limit = 3 }\n", had, "initializer"},
+		"a variable that runs code":      {rulesPath, selfRules, two + "\nvar started = fmt.Sprint(1)\n", had, "runs code"},
+		"a constant":                     {rulesPath, selfRules, two + "\nconst grace = 2\n", had, ""},
 		"a standard import":              {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"os\"\n)", 1) + "\nvar _ = os.Args\n", had, ""},
 		"a module import":                {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"github.com/agent-sh/momentum/internal/plain\"\n)", 1), had, ""},
 		"a protected package's import":   {rulesPath, selfRules, strings.Replace(two, "import \"fmt\"", "import (\n\t\"fmt\"\n\t\"github.com/agent-sh/momentum/internal/config\"\n)", 1), had, "never changes"},
@@ -80,7 +82,11 @@ func TestALandableFilesChangeKeepsItsPackageAndItsTests(t *testing.T) {
 		"a TestMain":                     {rulesTestPath, selfRulesTest, selfRulesTest + "\nfunc TestMain(m *testing.M) {}\n", had, "TestMain"},
 		"a test file deleted":            {rulesTestPath, selfRulesTest, "", had, "deletes a test file"},
 		"a new test file":                {"internal/supervise/new_test.go", "", selfRulesTest, had, ""},
-		"a file that is not Go":          {"internal/detect/testdata/x.txt", "a", "b", had, ""},
+		"a test's data":                  {"internal/detect/testdata/x.txt", "a", "b", had, ""},
+		"a script":                       {"internal/detect/fix.sh", "a", "b", had, "no Go file"},
+		"a test of one platform":         {"internal/supervise/x_arm64_test.go", "a", "b", had, "one platform"},
+		"a file of one platform":         {"internal/supervise/x_linux.go", "a", "b", had, "one platform"},
+		"an assembly file":               {"internal/supervise/sys_amd64.s", "a", "b", had, "no Go file"},
 	} {
 		var old, now []byte
 		if c.old != "" {

@@ -1622,7 +1622,7 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 		return hand, nil
 	}
 	out = slices.Clone(hand)
-	had := map[string]map[string]bool{} // each package's imports at the base, by its directory
+	had := map[string][2]map[string]bool{} // each package's imports at the base, by its directory: its landable code's, then every file's
 	for _, c := range changed {
 		if !selfLandable(c) || slices.Contains(out, c) {
 			continue
@@ -1643,11 +1643,13 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 		switch {
 		case !plainNow && !gone:
 			why = "the change leaves no plain file there"
+		case old == nil && strings.HasPrefix(c, "internal/capacity/"):
+			why = "the loop adds no file to the package that deletes files"
 		case isReplayed(c) && s.ReplayStore == "" && (p.Check == nil || p.Check.Replay == nil):
 			why = "no copy of the store is here to replay a detector change over: a loop pass checks it"
 		default:
 			dir := path.Dir(c)
-			if had[dir] == nil {
+			if _, ok := had[dir]; !ok {
 				if had[dir], err = s.packageImports(ctx, p, base, dir); err != nil {
 					return nil, err
 				}
@@ -1655,7 +1657,11 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 			if gone {
 				now = nil
 			}
-			why = selfKept(c, old, now, had[dir])
+			imports := had[dir][0]
+			if strings.HasSuffix(c, "_test.go") {
+				imports = had[dir][1]
+			}
+			why = selfKept(c, old, now, imports)
 		}
 		if why != "" {
 			out = append(out, c)
@@ -1672,25 +1678,31 @@ func (s *Ship) absent(ctx context.Context, p Package, rev, name string) (bool, e
 	return strings.TrimSpace(entry) == "", err
 }
 
-// packageImports are the imports of the Go files a directory holds at a revision.
-func (s *Ship) packageImports(ctx context.Context, p Package, rev, dir string) (map[string]bool, error) {
+// packageImports are the imports of the Go files a directory holds at a revision: of the files the loop lands that are
+// no test files (what a file of its code may add), and of all of them (what a test file may add). A file a person
+// lands, or a test, may import what the loop's code may not.
+func (s *Ship) packageImports(ctx context.Context, p Package, rev, dir string) ([2]map[string]bool, error) {
 	// names end with a NUL (-z): git quotes a name with a byte it does not print
 	list, err := s.git(ctx, p.Host, "ls-tree", "-z", "--name-only", rev, "--", dir+"/")
 	if err != nil {
-		return nil, err
+		return [2]map[string]bool{}, err
 	}
-	out := map[string]bool{}
+	out := [2]map[string]bool{{}, {}}
 	for _, name := range strings.Split(list, "\x00") {
 		if !strings.HasSuffix(name, ".go") {
 			continue
 		}
 		b, plainFile, err := s.blob(ctx, p, rev, name)
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 		if plainFile {
+			code := selfLandable(name) && !strings.HasSuffix(name, "_test.go")
 			for _, i := range fileImports(b) {
-				out[i] = true
+				out[1][i] = true
+				if code {
+					out[0][i] = true
+				}
 			}
 		}
 	}

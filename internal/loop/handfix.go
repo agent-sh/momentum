@@ -19,6 +19,10 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
+// keyContext is how far before a span its events are keyed from: past the detectors' longest look back at an event's
+// neighbours (a read's write within the hour, a refusal heeded within minutes), with room.
+const keyContext = 24 * time.Hour
+
 // HandFixWindow is the window a fix by hand is measured over, before it and after it: a week, the loop's shortest
 // whole-weeks window, so both windows hold the same days.
 const HandFixWindow = 7 * 24 * time.Hour
@@ -54,7 +58,10 @@ func (r *Runner) measureWorking(ctx context.Context, o Options) ([]Measured, err
 		return nil, nil
 	}
 	now := r.now()
-	week, err := r.keyed(ctx, now.Add(-HandFixWindow), now)
+	// keyed from a day before the week, so an event near its start keeps the context it was keyed with (a refusal's
+	// heeding, a read's write after it); the week's evidence alone is judged (detectorFix)
+	week, err := r.keyed(ctx, now.Add(-HandFixWindow-keyContext), now)
+	week.since = now.Add(-HandFixWindow)
 	if err != nil {
 		r.logf("measure: the detectors could not key the last week: %v", err)
 		return nil, nil
@@ -109,20 +116,15 @@ func (r *Runner) measureOne(ctx context.Context, c store.Case, week keyedSpan, n
 	if live, err := r.livePackage(c); err != nil || live {
 		return m, false, nil // a change of the loop's is on its way, or a package its own steps report: they decide the case
 	}
-	if !dry {
-		// a case another ship step holds is decided on a later pass: nothing here is urgent
-		unlock, err := r.Ship.lock(ctx, c.ID)
-		if err != nil {
-			return m, false, nil
-		}
-		defer unlock()
-	}
 	if done, effect, err := r.detectorFix(ctx, c, week); err != nil {
 		return m, false, err
 	} else if done {
 		m.Status, m.Why = "detector fix", effect
 		if !dry {
-			if _, err := r.Store.CloseDetectorFix(ctx, c.ID, effect, "loop:measure"); err != nil {
+			if ok, err := r.closeWorking(ctx, c, func() error {
+				_, err := r.Store.CloseDetectorFix(ctx, c.ID, effect, "loop:measure")
+				return err
+			}); err != nil || !ok {
 				return m, false, err
 			}
 		}
@@ -141,9 +143,29 @@ func (r *Runner) measureOne(ctx context.Context, c store.Case, week keyedSpan, n
 		if f.Measured {
 			continue
 		}
-		return r.handFixed(ctx, c, f, now, dry)
+		return r.handFixed(ctx, c, f, fixes, now, dry)
 	}
 	return m, false, nil
+}
+
+// closeWorking makes a close of a working case under its ship lock, once the case and its package read again under
+// the lock still let it: the same episode and status, and no package of the loop's on its way. A case another ship
+// step holds, or that moved meanwhile, is decided on a later pass. The lock's directory is the package's, which the
+// case may not have yet: it is made only here, for a case that closes.
+func (r *Runner) closeWorking(ctx context.Context, c store.Case, close func() error) (bool, error) {
+	unlock, err := r.Ship.lock(ctx, c.ID)
+	if err != nil {
+		return false, nil
+	}
+	defer unlock()
+	now, err := r.Store.CaseByID(ctx, c.ID)
+	if err != nil || now.ID != c.ID || now.Episode != c.Episode || now.Status != c.Status {
+		return false, err
+	}
+	if live, err := r.livePackage(now); err != nil || live {
+		return false, err
+	}
+	return true, close()
 }
 
 // livePackage says whether the case has a package of the loop's that has not ended: its own steps decide the case.
@@ -216,31 +238,45 @@ func (r *Runner) detectorFix(ctx context.Context, c store.Case, span keyedSpan) 
 // DetectorActor is who the loop's detectors file their findings as: the pass's detect step.
 const DetectorActor = "loop:detect"
 
-// detectorOpened says whether the loop's detectors opened the case, by its log.
+// detectorOpened says whether every piece of the case's evidence is the loop's detectors': they opened it, filed all
+// its evidence, and no other case went into it, by its log. Evidence filed by hand, or merged from a case a person or
+// an agent opened, may be events no detector ever keyed by the case's signatures.
 func (r *Runner) detectorOpened(ctx context.Context, c store.Case) (bool, error) {
 	log, err := r.Store.CaseLog(ctx, c.ID)
 	if err != nil {
 		return false, err
 	}
+	opened := false
 	for _, e := range log {
-		if e.Action == "opened" {
-			return e.Actor == DetectorActor, nil
+		switch e.Action {
+		case "opened", "evidence":
+			if e.Actor != DetectorActor {
+				return false, nil
+			}
+			opened = opened || e.Action == "opened"
+		case "merged":
+			return false, nil
 		}
 	}
-	return false, nil
+	return opened, nil
 }
 
 // handFixed measures a fix by hand once the week after it has passed and every source it counts has read past it: the
 // case's signatures' events, keyed by this binary's detectors, in the session hours (or the machine's, or the owner's)
 // of the week before the fix against the week after (measure.Compare). A rate measurably lower closes the case as
 // improved; anything else records what it found, and the case stays as it is.
-func (r *Runner) handFixed(ctx context.Context, c store.Case, f store.HandFix, now time.Time, dry bool) (Measured, bool, error) {
+func (r *Runner) handFixed(ctx context.Context, c store.Case, f store.HandFix, fixes []store.HandFix, now time.Time, dry bool) (Measured, bool, error) {
 	m := Measured{Case: c.ID, Title: c.Title, Due: f.At.Add(HandFixWindow)}
 	if now.Before(m.Due) {
 		m.Status, m.Why = "measuring", fmt.Sprintf("a fix by hand (%s) is measured once the week after it has passed", f.Ref)
 		return m, true, nil
 	}
-	span, err := r.keyed(ctx, f.At.Add(-HandFixWindow), m.Due)
+	// before the fix is counted over the four weeks a loop's plan spans (its gate and its baseline): a person fixes a
+	// problem while it is active, so the week just before the fix alone holds the spike that made the case and would
+	// make any fix look like one; the three quieter weeks before it hold the problem's ordinary rate, and dilute it
+	from := f.At.Add(-(measure.BaselineWindows + 1) * HandFixWindow)
+	until := f.At
+	span, err := r.keyed(ctx, from.Add(-keyContext), m.Due)
 	if err != nil {
 		return m, false, err
 	}
@@ -254,43 +290,50 @@ func (r *Runner) handFixed(ctx context.Context, c store.Case, f store.HandFix, n
 		if !slices.Contains(sources, e.Source) {
 			sources = append(sources, e.Source)
 		}
-		if e.TS.Before(f.At) {
+		switch {
+		case e.TS.Before(from):
+		case e.TS.Before(until):
 			before = append(before, e)
-		} else {
+		case !e.TS.Before(f.At):
 			after = append(after, e)
 		}
 	}
 	record := func(effect string) (Measured, bool, error) {
 		m.Status, m.Why = "no measured effect", effect
 		if !dry {
-			if err := r.Store.HandFixMeasured(ctx, c.ID, f, effect, "loop:measure"); err != nil {
+			if ok, err := r.closeWorking(ctx, c, func() error { return r.Store.HandFixMeasured(ctx, c.ID, f, effect, "loop:measure") }); err != nil || !ok {
 				return m, false, err
 			}
 		}
 		return m, true, nil
 	}
 	if len(before) == 0 {
-		if done, effect, err := r.detectorFix(ctx, c, keyedSpan{since: span.since, until: f.At, sig: span.sig, events: span.events}); err != nil {
+		if done, effect, err := r.detectorFix(ctx, c, keyedSpan{since: from, until: f.At, sig: span.sig, events: span.events}); err != nil {
 			return m, false, err
 		} else if done {
 			m.Status, m.Why = "detector fix", effect
 			if !dry {
-				_, err = r.Store.CloseDetectorFix(ctx, c.ID, effect, "loop:measure")
+				if ok, err := r.closeWorking(ctx, c, func() error {
+					_, err := r.Store.CloseDetectorFix(ctx, c.ID, effect, "loop:measure")
+					return err
+				}); err != nil || !ok {
+					return m, false, err
+				}
 			}
-			return m, true, err
+			return m, true, nil
 		}
-		return record(fmt.Sprintf("nothing to measure the fix by hand (%s) by: no event of the case's signatures in the week before it", f.Ref))
+		return record(fmt.Sprintf("nothing to measure the fix by hand (%s) by: no event of the case's signatures in the four weeks before it", f.Ref))
 	}
 	sort.Strings(sources)
 	units := unitsOf(before)
 	plan := Plan{Signal: Signal{Source: sources[0]}, Units: units, Sources: sources}
-	if unread, err := unreadWindow(ctx, r.Store, plan, f.At.Add(-HandFixWindow), m.Due, r.Dir); err != nil {
+	if unread, err := unreadWindow(ctx, r.Store, plan, from, m.Due, r.Dir); err != nil {
 		return m, false, err
 	} else if len(unread) > 0 {
 		m.Status, m.Why = "waiting", "the store has not read past the week after the fix by hand: "+strings.Join(unread, ", ")
 		return m, true, nil
 	}
-	b, err := tallySources(ctx, r.Store, plan.Signal, units, before, f.At.Add(-HandFixWindow), f.At, r.Dir, sources)
+	b, err := tallySources(ctx, r.Store, plan.Signal, units, before, from, until, r.Dir, sources)
 	if err != nil {
 		return m, false, err
 	}
@@ -298,7 +341,22 @@ func (r *Runner) handFixed(ctx context.Context, c store.Case, f store.HandFix, n
 	if err != nil {
 		return m, false, err
 	}
+	if b.Hits < measure.MinBefore {
+		return record(fmt.Sprintf("the fix by hand (%s) is not measured: the four weeks before it hold %d hours of the problem, fewer than the %d a measurement needs", f.Ref, b.Hits, measure.MinBefore))
+	}
 	res, compared := measure.Compare(b, a)
+	// each fix of an episode is another chance to pass by luck: the n-th is held to the test's level divided by n
+	n := 1
+	for _, g := range fixes {
+		if g.Measured || g.Ref == f.Ref {
+			n++
+		}
+	}
+	n--
+	if compared && res.Improved && res.P >= measure.Alpha/float64(n) {
+		res.Improved = false
+		res.Effect += fmt.Sprintf(" (fix %d of its episode, held to p below %.3f)", n, measure.Alpha/float64(n))
+	}
 	if compared {
 		m.Result = &res
 	}
@@ -313,12 +371,15 @@ func (r *Runner) handFixed(ctx context.Context, c store.Case, f store.HandFix, n
 	if dry {
 		return m, true, nil
 	}
-	if err := r.noteOnce(ctx, store.Note{ID: "shipped:" + store.IDPart(c.ID) + ":hand:" + strconv.FormatInt(f.At.UnixMilli(), 10), Kind: store.NoteShipped,
-		Title:  plainClip("improved by a fix by hand: "+c.Title, store.TitleMax),
-		Detail: fmt.Sprintf("A fix made by hand (%s, %s) measurably cut the problem over the week after it.", f.Ref, f.How), Effect: res.Effect}); err != nil {
-		return m, false, err
-	}
-	if _, err := r.Store.CloseHandFixed(ctx, c.ID, f, HandFixWindow, b.Hits, a.Hits, res.Effect, "loop:measure"); err != nil {
+	if ok, err := r.closeWorking(ctx, c, func() error {
+		if err := r.noteOnce(ctx, store.Note{ID: "shipped:" + store.IDPart(c.ID) + ":hand:" + strconv.FormatInt(f.At.UnixMilli(), 10), Kind: store.NoteShipped,
+			Title:  plainClip("improved by a fix by hand: "+c.Title, store.TitleMax),
+			Detail: fmt.Sprintf("A fix made by hand (%s, %s) measurably cut the problem over the week after it.", f.Ref, f.How), Effect: res.Effect}); err != nil {
+			return err
+		}
+		_, err := r.Store.CloseHandFixed(ctx, c.ID, f, HandFixWindow, b.Hits, a.Hits, res.Effect, "loop:measure")
+		return err
+	}); err != nil || !ok {
 		return m, false, err
 	}
 	return m, true, nil

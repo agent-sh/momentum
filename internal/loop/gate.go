@@ -233,30 +233,43 @@ func Protected() []string { return ProposalProtected() }
 // file's test file lands with it. The parts of them selfHand names are a person's. What is not here is a person's to
 // land (Hand landing), and ProposalProtected no change touches at all.
 var selfLand = []string{
-	"internal/detect/",           // the detectors: a change is replayed over the stored history before it lands
-	"internal/supervise/",        // supervision's rules and engine
-	"internal/evidenceview/",     // how an event's record is shown
-	"internal/request/",          // the owner's requests and their follow-ups
-	"sessions/",                  // the live session layer's readers
-	"internal/capacity/rules.go", // the capacity rules a capacity run applies
+	"internal/detect/",    // the detectors: a change is replayed over the stored history before it lands
+	"internal/supervise/", // supervision's rules and engine
+	"internal/request/",   // the owner's requests and their follow-ups
+	"sessions/",           // the live session layer's readers, by harness
+	// the capacity rules a capacity run applies, once a person has made the file: the loop adds no file to the
+	// package that deletes files (selfScope)
+	"internal/capacity/rules.go",
 	"README.md",
 }
 
 // selfHand are the parts of selfLand that stay a person's to land: the sessions detector, which reads the transcripts
 // and Hermes's database, so no copy of the store replays it; supervision's history and replay, which the sessions
-// detector reads and which measure the rules; and the one part of the session layer that types into a session,
-// whose checks keep a message from answering a dialog or a permission.
-var selfHand = []string{"internal/detect/sessions.go", "internal/supervise/history.go", "internal/supervise/replay.go", "sessions/act/"}
+// detector reads and which measure the rules; the one part of the session layer that types into a session, whose
+// checks keep a message from answering a dialog or a permission; and what the store, which no change touches, builds
+// on: the session layer's own package (its files directly under sessions/, sessionsRoot) and its stamps.
+var selfHand = []string{"internal/detect/sessions.go", "internal/supervise/history.go", "internal/supervise/replay.go", "sessions/act/", "sessions/state/"}
+
+// sessionsRoot is the session layer's own package, which the store imports: its files directly under sessions/.
+func sessionsRoot(c string) bool {
+	rest, ok := strings.CutPrefix(strings.ToLower(c), "sessions/")
+	return ok && !strings.Contains(rest, "/")
+}
 
 // replayed are the landable paths whose change the host replays over the stored history (selfReplay).
 var replayed = []string{"internal/detect/"}
 
 // selfLandable says whether the loop lands a change to a path of its own repository itself, by the path: in selfLand,
-// not in selfHand, or the test file of a file selfLand names. The case is the path's as given: a path that differs in
-// case is another path on a disk that tells them apart.
+// not in selfHand nor the session layer's own package, or the test file of a file selfLand names. selfLand is read
+// with the path's case, selfHand without it, so a path that only differs in case is never the loop's to land where
+// the path it folds to is a person's.
 func selfLandable(c string) bool {
+	if sessionsRoot(c) {
+		return false
+	}
 	for _, p := range selfHand {
-		if inPath(c, p) || strings.HasSuffix(p, ".go") && c == strings.TrimSuffix(p, ".go")+"_test.go" {
+		// without case: a checkout on a case-insensitive disk writes sessions/Act/x.go into sessions/act/
+		if inPathFold(c, p) || strings.HasSuffix(p, ".go") && strings.EqualFold(c, strings.TrimSuffix(p, ".go")+"_test.go") {
 			return false
 		}
 	}
