@@ -802,7 +802,7 @@ func TestATryThatWorkedThenFailedAgainStartsTheTriesOver(t *testing.T) {
 	sv := supervisor(st, f, &now)
 	s := erroring()
 	at := t0
-	for try := 0; try < 4; try++ {
+	for try := 0; try < 2; try++ { // fewer stops than the rule's tries: the stops bound (moves) stays out of it
 		now = at.Add(DefaultParams.Backoff[0])
 		run(t, sv, s)
 		if len(f.sent) != try+1 {
@@ -817,26 +817,27 @@ func TestATryThatWorkedThenFailedAgainStartsTheTriesOver(t *testing.T) {
 	if r, c := results(t, st), events(t, st, KindCase); !r[WorkedThenFailed] || r[FailedAgain] || r[Worked] || len(c) != 0 {
 		t.Fatalf("outcomes %v, cases %+v", r, c)
 	}
-	// the fifth lands and meets the error with no tool call: failed again, and the next wait is the second
+	// the third lands and meets the error with no tool call: failed again, and the next wait is the second
 	now = at.Add(DefaultParams.Backoff[0])
 	run(t, sv, s)
-	lands(s, strings.TrimPrefix(f.sent[4], "%7 "), now.Add(time.Second), false)
+	lands(s, strings.TrimPrefix(f.sent[2], "%7 "), now.Add(time.Second), false)
 	at = now.Add(5 * time.Minute)
 	s.Since = at
 	now = at.Add(DefaultParams.Backoff[0])
 	run(t, sv, s)
-	if r := results(t, st); !r[FailedAgain] || len(f.sent) != 5 {
+	if r := results(t, st); !r[FailedAgain] || len(f.sent) != 3 {
 		t.Fatalf("outcomes %v, sent %d a minute after a try that did no work", r, len(f.sent))
 	}
 	now = at.Add(DefaultParams.Backoff[1])
 	run(t, sv, s)
-	if len(f.sent) != 6 {
+	if len(f.sent) != 4 {
 		t.Fatalf("sent %d at the second wait", len(f.sent))
 	}
 }
 
 // A provider that lets one call through per try, then fails: the tries start over each time, and the rule still
-// sends no more than one message per second wait of the backoff, with no case.
+// sends no more than one message per second wait of the backoff. Once its messages have moved the session through
+// as many stops as the rule has tries, the next stop opens one case and nothing more is sent.
 func TestTriesThatEachWorkThenFailAreSpacedByTheSecondWait(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{}
@@ -858,8 +859,94 @@ func TestTriesThatEachWorkThenFailAreSpacedByTheSecondWait(t *testing.T) {
 		lands(s, strings.TrimPrefix(f.sent[n], "%7 "), now.Add(time.Second), true)
 		s.Since = now.Add(2 * time.Second)
 	}
-	if c := events(t, st, KindCase); len(f.sent) < 4 || len(c) != 0 {
+	if c := events(t, st, KindCase); len(f.sent) != len(DefaultParams.Backoff) || len(c) != 1 || !strings.Contains(metaMap(c[0])["why"].(string), reasonRepeat) {
 		t.Fatalf("sent %d in 20 minutes, cases %+v", len(f.sent), c)
+	}
+}
+
+// A session whose every message moves it on to the next stop of the same kind, with no owner turn between, gets as
+// many messages as the rule has tries, then one case, and the rule holds until its owner types: a turn of the
+// session's own does not lift that case. Before the bound, each message that worked started the tries over and a
+// session could get a message at every stop for hours.
+func TestARuleThatKeepsMovingASessionToTheSameStopHoldsForItsOwner(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	at := t0
+	for stop := 0; stop < 10; stop++ { // a stop every 30 minutes, each ended by a message whose turn worked
+		now = at.Add(DefaultParams.Backoff[0])
+		n := len(f.sent)
+		run(t, sv, s)
+		if len(f.sent) > n {
+			lands(s, strings.TrimPrefix(f.sent[n], "%7 "), now.Add(time.Second), true)
+			s.Log.Add(sessions.Entry{Role: sessions.RoleAssistant, Text: err503})
+			s.Seq = s.Log.Seq()
+		}
+		at = now.Add(30 * time.Minute)
+		s.TurnBegan, s.Since = at.Add(-time.Minute), at
+		now = at.Add(time.Second)
+		run(t, sv, s)
+	}
+	cases := events(t, st, KindCase)
+	if len(f.sent) != len(DefaultParams.Backoff) || len(cases) != 1 || !strings.Contains(metaMap(cases[0])["why"].(string), reasonRepeat) {
+		t.Fatalf("sent %d over ten stops, cases %+v", len(f.sent), cases)
+	}
+	if _, ok := note(t, st, "supervise:"+s.Key); !ok {
+		t.Fatal("the case left no problem note for the report")
+	}
+	// the owner types and the session stops the same way again: the rule sends again
+	typed(s, "keep going on the notes", now.Add(time.Minute))
+	if _, err := st.Put(context.Background(), []store.Event{{Source: store.Transcripts, SourceKey: StoreSession(s) + "@owner",
+		TS: now.Add(time.Minute), Session: StoreSession(s), Actor: store.ActorOwner, Kind: "owner_text", Summary: "keep going on the notes"}}); err != nil {
+		t.Fatal(err)
+	}
+	s.Log.Add(sessions.Entry{Role: sessions.RoleAssistant, Text: err503})
+	s.Seq = s.Log.Seq()
+	at = now.Add(20 * time.Minute)
+	s.Since = at
+	now = at.Add(DefaultParams.OwnerWindow + DefaultParams.Backoff[0])
+	run(t, sv, s)
+	if len(f.sent) != len(DefaultParams.Backoff)+1 {
+		t.Fatalf("after the owner's turn: sent %d, want one more", len(f.sent))
+	}
+}
+
+// The promise rule ships live, bounded as before: a message whose turn ends on another promise is that promise
+// again, so two messages without an owner turn in between, then a case.
+func TestThePromiseRuleIsLiveAndBoundedAcrossStops(t *testing.T) {
+	if !Live[RulePromise] {
+		t.Fatal("the promise rule does not ship live")
+	}
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0
+	sv := supervisor(st, f, &now)
+	sv.Live = Live
+	s := &sessions.Session{Key: "sess-p", Tool: "claude", Name: "import", Where: "work:2.1", Pane: "%9", PID: 42,
+		Phase: sessions.Idle, Since: t0, Tasks: []sessions.Task{}, Log: &sessions.Log{}}
+	promised := func(at time.Time) {
+		s.Log.Add(sessions.Entry{Role: sessions.RoleAssistant, Text: "The import is running. I'll report when it finishes."})
+		s.LastText, s.Since, s.Seq = "The import is running. I'll report when it finishes.", at, s.Log.Seq()
+	}
+	promised(t0)
+	at := t0
+	for stop := 0; stop < 5; stop++ {
+		now = at.Add(DefaultParams.PromiseWait)
+		n := len(f.sent)
+		run(t, sv, s)
+		if len(f.sent) > n {
+			lands(s, strings.TrimPrefix(f.sent[n], "%9 "), now.Add(time.Second), true)
+		}
+		at = now.Add(10 * time.Minute)
+		promised(at)
+		now = at.Add(time.Second)
+		run(t, sv, s)
+	}
+	cases := events(t, st, KindCase)
+	if len(f.sent) != DefaultParams.PromiseTries || len(cases) != 1 {
+		t.Fatalf("sent %q, cases %+v", f.sent, cases)
 	}
 }
 

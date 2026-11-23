@@ -131,8 +131,31 @@ var DefaultParams = Params{
 // when its replay acts unasked no more often than the owner's own nudges go to a session that would have gone on
 // by itself, or when the owner made it live over its replay, as he did stalled. The transient rule is live by what
 // it sends: the continue a person types at such a stop, sent before a session that goes on by itself has shown it
-// (SPEC.md, Supervision).
-var Live = map[string]bool{RuleTransient: true, RuleAccess: true, RuleStalled: true}
+// (SPEC.md, Supervision). The promise rule is live by the owner's call too: a session that promised work and went
+// idle mostly never resumed without him, and its message only asks it to do the step it named.
+var Live = map[string]bool{RuleTransient: true, RuleAccess: true, RuleStalled: true, RulePromise: true}
+
+// RuleTries is how many messages a rule sends for one stop before a case: its tries, or for the transient rule
+// its waits. The same number bounds the stops a rule's messages may move a session through since its owner's last
+// turn (Supervisor.Run): a session that keeps stopping the same way after each message that moved it is one
+// problem, not a new one each time. The overdue rule counts its runs by job instead (overdueTries), so it has none.
+func RuleTries(rule string, p Params) int {
+	switch rule {
+	case RuleTransient:
+		return len(p.Backoff)
+	case RuleAccess:
+		return p.AccessTries
+	case RuleCutoff:
+		return p.CutoffTries
+	case RuleReopened:
+		return 1
+	case RuleStalled:
+		return p.StalledTries
+	case RulePromise:
+		return p.PromiseTries
+	}
+	return 0
+}
 
 // Decision is what supervision does about one session now.
 type Decision struct {

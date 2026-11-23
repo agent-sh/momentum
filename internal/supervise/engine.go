@@ -225,6 +225,15 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		tries := h.tries(ownerAt, reopened)
 		tries[RuleOverdue] = h.overdueTries(stop, ownerAt)
 		d := Decide(stop, tries, sv.Params, probe, now)
+		// A new episode after the rule's messages moved the session through as many stops as the rule has tries, with
+		// no owner turn between: the session keeps stopping the same way, and each message only starts the next
+		// stop. One case, and the rule holds until he comes back (reasonRepeat).
+		if d.Verdict == Act && tries[d.Rule] == 0 && d.Rule != RuleOverdue && !h.closed(d.Rule, ownerAt, reopened) {
+			if n, lim := h.moves(d.Rule, ownerAt), RuleTries(d.Rule, sv.Params); lim > 0 && n >= lim {
+				d.Verdict, d.Try = Case, n
+				d.Why = fmt.Sprintf("%s: it stopped the same way again after %d of the rule's messages moved it since its owner's last turn", reasonRepeat, n)
+			}
+		}
 		shut := false // the rule would have acted, and a case of this stop keeps it from sending
 		until := "the session moves on or its owner comes back"
 		if d.Rule != "" && d.Verdict != Case && d.Verdict != Skip && h.closed(d.Rule, ownerAt, reopened) {
@@ -732,6 +741,9 @@ const (
 	reasonPasted       = "pasted, not known to be submitted" // the paste may still sit on the line
 	reasonNoWay        = "no way to type into it"
 	reasonNotDelivered = "not delivered"
+	// reasonRepeat is a session that stopped the same way again after as many of a rule's messages moved it as the
+	// rule has tries, since its owner's last turn: no turn of the session's own lifts it, only his.
+	reasonRepeat = "keeps stopping"
 )
 
 func history(evs []store.Event) past {
@@ -832,6 +844,19 @@ func (h past) tries(ownerAt time.Time, reopened map[string]time.Time) Tries {
 	return t
 }
 
+// moves counts the rule's messages since the owner's last turn whose turn did work (moved), however long ago: each
+// ended an episode, and tries starts the next one from zero, so only this count bounds how many stops in a row the
+// rule may carry a session through without him.
+func (h past) moves(rule string, ownerAt time.Time) int {
+	n := 0
+	for _, s := range h.sends {
+		if s.rule == rule && s.at.After(ownerAt) && s.moved() {
+			n++
+		}
+	}
+	return n
+}
+
 // overdueTries counts the overdue rule's resyncs for the stop's run: those for runs of the same job, or for the
 // same loop's wakeups, since the owner's last turn and since that job or loop last ran.
 func (h past) overdueTries(stop Stop, ownerAt time.Time) int {
@@ -887,7 +912,7 @@ func (h past) lifts(i int, ownerAt time.Time) bool {
 		return false
 	}
 	c := h.cases[i]
-	if c.going || c.rule == RuleOverdue || c.reason == reasonNoWay || c.reason == reasonPasted {
+	if c.going || c.rule == RuleOverdue || c.reason == reasonNoWay || c.reason == reasonPasted || c.reason == reasonRepeat {
 		return false
 	}
 	if c.reason != reasonNotDelivered {
