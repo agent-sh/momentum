@@ -884,7 +884,9 @@ func buildScope(repo string) string {
 		"package the change touches: both must pass. A change to internal/detect/ is replayed over the last week of the stored " +
 		"history with the base's detectors and with the change's: it may key events by other signatures, and it may stop keying the " +
 		"events of this case's own signatures when they are no failures, but a change that stops keying events of any other signature " +
-		"is refused. A fix that needs other paths is still checked and reviewed, then proposed for a person to land by hand; the loop " +
+		"is refused. A change confined to internal/detect/ whose replay re-keys or drops every event of this case's own signatures is " +
+		"judged by that replay, not by a forward count of its signal: the case closes as a detector fix once it is in effect. " +
+		"A fix that needs other paths is still checked and reviewed, then proposed for a person to land by hand; the loop " +
 		"never lands it. No change touches CI configuration (" + ci + ") or these, which the loop's judgment and authority rest on: " +
 		strings.Join(ProposalProtected(), ", ") + " " + ownReachException + "."
 }

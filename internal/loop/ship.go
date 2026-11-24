@@ -229,6 +229,11 @@ type Plan struct {
 	// Guard, when set, makes the plan a guard rather than a measurement: the problem is too new or too rare for a
 	// share to fall, or no recent event reaches it, and the watch asks only whether it comes back (guardPlan).
 	Guard *Guard `json:"guard,omitempty"`
+	// Replay, when set, makes the plan the check's detector replay rather than a count: the change is confined to
+	// the loop's own detectors and its replay moved every stored event of the case's own signatures (replayPlan), so
+	// the case's problem is the detector's keying, which no forward count of the signal measures. Its signal is the
+	// build's, kept for the record and never counted; once the change is in effect the case closes as a detector fix.
+	Replay bool `json:"replay,omitempty"`
 }
 
 // Guard is a plan's recurrence watch for a problem that has stopped (SPEC, Measurement, Guards): a watch, not a
@@ -997,10 +1002,16 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 		return p, refused("a proposal needs its rollback: how the change is undone")
 	}
 	var plan Plan
+	replay, err := replayPlan(c, p, paths, pr, s.now())
+	if err != nil {
+		return p, err
+	}
 	if p.Kind == KindConfig {
 		if plan, err = configPlan(pr.Signal, pr.Window, s.now()); err != nil {
 			return p, err
 		}
+	} else if replay != nil {
+		plan = *replay
 	} else if plan, err = s.validPlan(ctx, c, pr.Signal, pr.Window, pr.Installed, s.now()); err != nil {
 		var wait *waitingPlan
 		if errors.As(err, &wait) {
@@ -1015,8 +1026,10 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 		p.ReadWait, p.ReadUntil = time.Time{}, time.Time{}
 		s.runner().resolve(ctx, &p)
 	}
-	if err := s.editsSignal(ctx, p, pr.Signal); err != nil {
-		return p, err
+	if replay == nil { // a replay plan counts no signal: a detector fix may rewrite the words its detector keys
+		if err := s.editsSignal(ctx, p, pr.Signal); err != nil {
+			return p, err
+		}
 	}
 	title, err := s.public(ctx, strings.TrimSpace(pr.Title))
 	if err != nil {
@@ -2400,7 +2413,10 @@ func (s *Ship) packageText(c store.Case, p Package) string {
 	fmt.Fprintf(&b, "- Check: `%s` fails without the change (exit %d) and passes with it (%.0f s).\n", strings.Join(p.Check.Test, " "),
 		p.Check.Before.Exit, p.Check.After.Seconds)
 	sig, _ := json.Marshal(p.Plan.Signal)
-	if g := p.Plan.Guard; g != nil {
+	if p.Plan.Replay && p.Check.Replay != nil {
+		fmt.Fprintf(&b, "- Judged by its detector replay, not counted: the change is confined to momentum's own detectors, and its replay (%s) moved every stored event of the case's own signatures and no other signature's. The case's problem is the detector's keying, which no forward count measures: once the change is in effect the case closes as a detector fix, not as an improvement.\n",
+			p.Check.Replay.Summary())
+	} else if g := p.Plan.Guard; g != nil {
 		chance := "the history holds no incident after its first, so there is no rate to compare"
 		if g.Incidents > 0 {
 			chance = fmt.Sprintf("its report gives P, the probability that the problem, had it kept happening, would have recurred within the exposure watched (%.0f%% at %d units)",

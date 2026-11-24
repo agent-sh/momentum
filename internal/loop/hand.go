@@ -344,7 +344,7 @@ func (s *Ship) caseNoteOnce(ctx context.Context, id, action, detail string) erro
 // landing. A count that waits on a reader holds the landing for the next pass; one refused leaves the change to be
 // measured by hand (a plan without units), with a case log line that says why.
 func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit string, at time.Time) error {
-	if p.Plan != nil && at.Sub(p.Plan.At) > p.Plan.Window {
+	if p.Plan != nil && !p.Plan.Replay && at.Sub(p.Plan.At) > p.Plan.Window { // a replay plan counts nothing to count again
 		plan, err := s.validPlan(ctx, c, p.Plan.Signal, p.Plan.Window, p.Plan.Installed, at)
 		var wait *waitingPlan
 		switch {

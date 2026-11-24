@@ -314,8 +314,10 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 			}
 		}
 		return m
-	case p.Plan.At.IsZero() || p.Plan.Units == "":
+	case p.Plan.At.IsZero() || p.Plan.Units == "" && !p.Plan.Replay:
 		return r.legacyPlan(ctx, c, dry)
+	case p.Plan.Replay && (p.Check == nil || p.Check.Replay == nil):
+		return failed("its plan is its check's detector replay, and the package holds no replay")
 	}
 	if p.Plan.Guard != nil && c.Status == store.CaseMeasuring {
 		// a guard's recurrence counts from its watch's first start, from the plan the proposal recorded, before any
@@ -327,13 +329,17 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 			return r.guardRegressed(ctx, c, &p, *p.Plan, m, back, from, now, dry)
 		}
 	}
-	plan, why, err := r.countingPlan(ctx, &p, dry)
-	if err != nil {
-		return failed(err.Error())
-	}
-	if why != "" {
-		m.Status, m.Why = "waiting", why
-		return m
+	// a replay plan counts no signal (replayPlan): it waits only for its change to be in effect
+	plan := *p.Plan
+	if !plan.Replay {
+		var why string
+		if plan, why, err = r.countingPlan(ctx, &p, dry); err != nil {
+			return failed(err.Error())
+		}
+		if why != "" {
+			m.Status, m.Why = "waiting", why
+			return m
+		}
 	}
 	since, why, err := r.Ship.InEffect(ctx, &p)
 	if err != nil {
@@ -393,6 +399,11 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		if rekeyed, dropped := p.Check.Replay.Diff.Touches(c.Signatures); rekeyed+dropped > 0 && p.Check.Replay.OwnKept == 0 {
 			return r.detectorFixed(ctx, c, &p, m, rekeyed, dropped, dry)
 		}
+	}
+	if plan.Replay {
+		// the case's signatures changed since its proposal, and its replay no longer moves all of their events: there is
+		// no count to fall back on, so a person decides
+		return failed("its plan is its check's detector replay, which no longer moves every event of the case's signatures")
 	}
 	if c.Status == store.CaseDeployed || plan.Guard == nil && !p.OutOfEffect.IsZero() {
 		m.Status, m.Due = "measuring", since.Add(plan.Window)

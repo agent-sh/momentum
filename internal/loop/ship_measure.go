@@ -178,6 +178,22 @@ func harnessFor(sig Signal, units string) string {
 	return sig.Harness
 }
 
+// installedFile checks the file a plan names the change installed in, when it names one: an absolute path, or one
+// under ~/, of a regular file that is there.
+func installedFile(installed string) error {
+	if installed == "" {
+		return nil
+	}
+	path := expandHome(installed)
+	if !filepath.IsAbs(path) {
+		return refused("the file the change is installed in is an absolute path or one under ~/, not %q", installed)
+	}
+	if st, err := os.Lstat(path); err != nil || !st.Mode().IsRegular() { // a link is none: the step opens the file without following one
+		return refused("the file the change is installed in, %s, is no file here (a link is none: name the file it points to)", installed)
+	}
+	return nil
+}
+
 // validPlan checks a measurement plan and returns it, counted at at: a signal that names a source, kinds and at
 // least one text, a window of whole weeks, at least MinSignal units of activity in which it counts an event
 // over the window before, and a signal that counts the case's own problem: the case holds events, and at least half
@@ -200,14 +216,8 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 			return Plan{}, refused("the signal's text %q is too short to name a problem", m)
 		}
 	}
-	if installed != "" {
-		path := expandHome(installed)
-		if !filepath.IsAbs(path) {
-			return Plan{}, refused("the file the change is installed in is an absolute path or one under ~/, not %q", installed)
-		}
-		if st, err := os.Lstat(path); err != nil || !st.Mode().IsRegular() { // a link is none: the step opens the file without following one
-			return Plan{}, refused("the file the change is installed in, %s, is no file here (a link is none: name the file it points to)", installed)
-		}
+	if err := installedFile(installed); err != nil {
+		return Plan{}, err
 	}
 	now := at // the proposal's own time: the readers that stopped are those that have not run for a window up to it, and the span is the four windows before it
 	first, err := Count(ctx, s.Store, sig, at.Add(-window), at, s.Dir, "")

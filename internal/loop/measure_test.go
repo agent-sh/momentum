@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/measure"
+	"github.com/agent-sh/momentum/internal/measure/rekey"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -375,6 +376,25 @@ func TestAPlanWithoutItsTimeOrUnitsMeasuresNothing(t *testing.T) {
 		if got := m.measure(t, Options{}); got.Status != "held" || m.theCase(t).Status != store.CaseDeployed {
 			t.Fatalf("a broken plan: %+v", got)
 		}
+	}
+}
+
+// A detector fix's plan is its replay (replayPlan): it counts no signal, and once its change is in effect the case
+// closes as a detector fix, never as improved.
+func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
+	m := measuredCase(t)
+	p, _, _ := m.r.Ship.Load(m.c.ID)
+	p.Plan = &Plan{Signal: goodSignal, Window: 7 * 24 * time.Hour, At: m.planAt, Replay: true}
+	p.Check = &Check{Replay: &SelfReplay{Diff: rekey.Diff{Before: 6, Dropped: []rekey.Count{{Signature: m.c.Signatures[0], N: 6}}},
+		Own: m.c.Signatures}}
+	if err := m.r.Ship.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.measure(t, Options{}); got.Status != "detector fix" {
+		t.Fatalf("a detector fix's replay plan: %+v", got)
+	}
+	if c := m.theCase(t); c.Status != store.CaseClosed || c.Reason != store.DetectorFix || !strings.Contains(c.Measurement.Effect, "dropped: 6") {
+		t.Fatalf("its case: %+v", c)
 	}
 }
 
