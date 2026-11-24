@@ -1317,3 +1317,46 @@ func TestOnlyARunThatTrustsItsLookRecordsTheWrites(t *testing.T) {
 		t.Errorf("a run records each process's written bytes: %v %v", snap, ws)
 	}
 }
+
+// A fill's note says what statfs saw: how much the disk's use grew over the window, the full percent it reaches at
+// that rate (a line, with the room the disk still has beside it, not the disk's end), and that the writers it names
+// count every byte they wrote, rewrites among them. A process that rewrites its files writes far more than the disk
+// grows, and the note must not read as if its writes were the growth.
+func TestAFillsNoteSaysTheNetGrowthTheLineAndTheRoom(t *testing.T) {
+	ctx := context.Background()
+	t.Chdir(t.TempDir()) // a short disk path: a note's title is clipped at store.TitleMax characters
+	dir := "d"
+	must(t, os.MkdirAll(dir, 0o755))
+	var fs syscall.Statfs_t
+	must(t, syscall.Statfs(dir, &fs))
+	used := int64(fs.Blocks-fs.Bfree) * int64(fs.Bsize)
+	st := openStore(t)
+	now := time.Now()
+	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: now.Add(-20 * time.Minute)},
+		[]store.DiskSample{{Disk: dir, At: now.Add(-20 * time.Minute), Size: 1 << 40, Used: used - 15<<30, Avail: 1 << 39}}, nil))
+	cfg := Config{Disks: []string{dir}, Fill: nearLine(t, dir)}.Normal()
+	proc := procRoot(t, fakeProc{pid: 21, ppid: 1, argv: []string{"rewriter"}, cwd: dir})
+	calls := 0
+	o := options(t, proc, now, nil)
+	o.Rules = []string{RuleUV}
+	o.Writes = func() map[int]int64 { calls++; return map[int]int64{21: int64(calls) * 400 << 20} }
+	if _, err := Run(ctx, cfg, st, o); err != nil {
+		t.Fatal(err)
+	}
+	n, ok, _ := st.Note(ctx, "capacity:fill:"+dir)
+	if !ok {
+		t.Fatal("no fill note")
+	}
+	line := fmt.Sprintf("reaches the %.0f%% line in ", cfg.Fill.Full)
+	for _, want := range []string{"d is growing 45 GiB/h (+15.0 GiB in 20m", "GiB free", line} {
+		if !strings.Contains(n.Title, want) {
+			t.Errorf("the title does not say %q: %q", want, n.Title)
+		}
+	}
+	if strings.Contains(n.Title, "full at this rate") {
+		t.Errorf("the title calls the line full: %q", n.Title)
+	}
+	if !strings.Contains(n.Detail, "a rewrite counts") || !strings.Contains(n.Detail, "rewriter (pid 21)") {
+		t.Errorf("the detail names the writer as a likely one, whose count holds rewrites: %q", n.Detail)
+	}
+}

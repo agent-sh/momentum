@@ -1065,6 +1065,13 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 				passed = append(passed, line)
 				continue
 			} else if repo == "" && target == "" {
+				if again, err := r.reachAgain(ctx, c, place, dry); err != nil {
+					return nil, "", err
+				} else if again {
+					// its fix's place is in reach now: it is investigated at a later pass, ahead of the open cases
+					passed = append(passed, c.ID+" goes back to be investigated: its fix's place is in the loop's reach now")
+					continue
+				}
 				if !dry {
 					r.keepHold(ctx, c, repoHold(place), true)
 				}

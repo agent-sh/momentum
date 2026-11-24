@@ -112,6 +112,8 @@ type DiskState struct {
 	Writers   []Writer      `json:"writers,omitempty"`
 	Err       string        `json:"error,omitempty"`
 	pctFull   float64
+	grew      int64   // what the disk's use grew by over Window, as statfs read it
+	line      float64 // the full percent (fill.full_pct) FullIn counts to, or 0 past it, where FullIn counts to no room left
 	mountPath string
 }
 

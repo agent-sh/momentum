@@ -739,12 +739,27 @@ func writersOf(runs []fastRun) []Writer {
 	return out
 }
 
+// fillTitle says what the fill is: the growth of the disk's use, as statfs read it over the window, and when it
+// reaches the full percent at that rate, which is a line and not the disk's end: the room it has is said with it.
+// Past the line, it says when no room is left.
 func fillTitle(d DiskState) string {
-	t := fmt.Sprintf("%s is filling at %.0f GiB/h (%.0f%% used)", d.Disk, d.Rate, d.pctFull)
-	if d.FullIn > 0 {
-		t += fmt.Sprintf("; full at this rate in %s", d.FullIn.Round(time.Minute))
+	t := fmt.Sprintf("%s is growing %.0f GiB/h (+%s in %s); %.0f%% used, %s free", d.Disk, d.Rate, gib(d.grew), roundSpan(d.Window), d.pctFull, gib(d.Avail))
+	switch {
+	case d.FullIn <= 0:
+	case d.line > 0:
+		t += fmt.Sprintf("; at this rate it reaches the %.0f%% line in %s", d.line, roundSpan(d.FullIn))
+	default:
+		t += fmt.Sprintf("; at this rate no room is left in %s", roundSpan(d.FullIn))
 	}
 	return t
+}
+
+// roundSpan is a span to the minute, or to the second under one.
+func roundSpan(d time.Duration) time.Duration {
+	if d >= time.Minute {
+		return d.Round(time.Minute)
+	}
+	return d.Round(time.Second)
 }
 
 func fillDetail(d DiskState) string {
@@ -756,13 +771,7 @@ func fillDetail(d DiskState) string {
 	for _, w := range d.Writers[:min(len(d.Writers), 4)] {
 		s := fmt.Sprintf("%s (pid %d)", w.Comm, w.PID)
 		if w.Over > 0 && w.Written > 0 {
-			over := time.Duration(w.Over * float64(time.Second))
-			if over >= time.Minute {
-				over = over.Round(time.Minute)
-			} else {
-				over = over.Round(time.Second)
-			}
-			s += fmt.Sprintf(" wrote %s in %s", gib(w.Written), over)
+			s += fmt.Sprintf(" wrote %s in %s", gib(w.Written), roundSpan(time.Duration(w.Over*float64(time.Second))))
 		}
 		if w.Rate >= 1 {
 			s += fmt.Sprintf(", %.0f MiB/s at a look", w.Rate)
@@ -773,7 +782,10 @@ func fillDetail(d DiskState) string {
 		}
 		parts = append(parts, s)
 	}
-	return "Writers: " + strings.Join(parts, "; ") + "."
+	// a process's count is every byte it wrote, to any disk, rewrites and files it replaced among them: the fill is
+	// the growth the title says, and these only name who may make it
+	return "Likely writers, by the bytes they wrote to any disk (a rewrite counts, so they may write far more than the disk grew): " +
+		strings.Join(parts, "; ") + "."
 }
 
 // group is one rule's report-only items for one reason, and their events.

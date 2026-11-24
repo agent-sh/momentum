@@ -48,8 +48,8 @@ func (r *runner) disk(ctx context.Context, disks []DiskState) bool {
 		}
 		for _, s := range samples { // the oldest sample in the window that is far enough back
 			if span := r.now.Sub(s.At); span >= minWindow {
-				d.Window = span
-				d.Rate = float64(d.Used-s.Used) / (1 << 30) / span.Hours()
+				d.Window, d.grew = span, d.Used-s.Used
+				d.Rate = float64(d.grew) / (1 << 30) / span.Hours()
 				break
 			}
 		}
@@ -59,6 +59,8 @@ func (r *runner) disk(ctx context.Context, disks []DiskState) bool {
 		past := left <= 0
 		if past {
 			left = float64(d.Avail)
+		} else {
+			d.line = r.cfg.Fill.Full
 		}
 		if d.Rate > 0 && left > 0 {
 			if hours := left / (1 << 30) / d.Rate; hours < float64(math.MaxInt64/int64(time.Hour)) { // a rate near none is never
