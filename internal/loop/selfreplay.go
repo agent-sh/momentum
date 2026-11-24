@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/detect"
-	"github.com/agent-sh/momentum/internal/measure"
 	"github.com/agent-sh/momentum/internal/measure/rekey"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/sandbox"
@@ -61,10 +60,8 @@ func (s *Ship) replayPlan(ctx context.Context, c store.Case, p Package, pr Propo
 	if judged, err := s.replayJudges(ctx, c, p); err != nil || !judged {
 		return nil, err
 	}
-	if !measure.WholeWeeks(pr.Window) {
-		return nil, refused("a measurement window is a whole number of weeks (7d, 14d and so on)")
-	}
-	if err := installedFile(pr.Installed); err != nil {
+	// its signal is not counted now, but is when the replay no longer judges the case at its close (replayLapsed)
+	if err := planShape(pr.Signal, pr.Window, pr.Installed); err != nil {
 		return nil, err
 	}
 	return &Plan{Signal: pr.Signal, Window: pr.Window, At: at, Installed: pr.Installed, Replay: true}, nil

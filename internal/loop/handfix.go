@@ -261,6 +261,11 @@ func (r *Runner) detectorOpened(ctx context.Context, c store.Case) (bool, error)
 			opened = opened || e.Action == "opened"
 		case "merged":
 			return false, nil
+		case "reopened", "regressed", "kept closed":
+			// evidence brought to a closed case, or a reopening by hand: someone's but the detectors' is no keying of theirs
+			if e.Actor != DetectorActor {
+				return false, nil
+			}
 		}
 	}
 	return opened, nil

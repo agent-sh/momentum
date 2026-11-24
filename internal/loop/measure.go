@@ -270,8 +270,14 @@ func (r *Runner) legacyPlan(ctx context.Context, c store.Case, dry bool) Measure
 // by hand. The step's own case log says which.
 func (r *Runner) replayLapsed(ctx context.Context, c store.Case, p *Package, m Measured, why string, dry bool) Measured {
 	plan, err := r.Ship.validPlan(ctx, c, p.Plan.Signal, p.Plan.Window, p.Plan.Installed, p.LandedAt)
-	if err != nil && !errors.Is(err, ErrRefused) {
+	var wait *waitingPlan
+	switch {
+	case err != nil && !errors.Is(err, ErrRefused):
 		m.Status, m.Why = "failed", err.Error() // a store that could not be read decides nothing
+		return m
+	case errors.As(err, &wait) && r.now().Sub(p.LandedAt) < p.Plan.Window:
+		// a count that waits on a reader is read again next pass, for a window after the landing (landHand)
+		m.Status, m.Why = "waiting", why+": its plan is counted again at its landing, which waits: "+wait.Error()
 		return m
 	}
 	if err != nil {

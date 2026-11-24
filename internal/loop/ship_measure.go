@@ -180,6 +180,23 @@ func harnessFor(sig Signal, units string) string {
 	return sig.Harness
 }
 
+// planShape checks what a plan names before anything is counted: a signal that names a source, kinds and texts long
+// enough to name a problem, a window of whole weeks, and the file it is installed in (installedFile).
+func planShape(sig Signal, window time.Duration, installed string) error {
+	switch {
+	case sig.Source == "" || len(sig.Kinds) == 0 || len(sig.Match) == 0:
+		return refused("a measurement signal names a source, kinds and at least one text its events hold")
+	case !measure.WholeWeeks(window):
+		return refused("a measurement window is a whole number of weeks (7d, 14d and so on)")
+	}
+	for _, m := range sig.Match {
+		if len(strings.TrimSpace(m)) < 4 {
+			return refused("the signal's text %q is too short to name a problem", m)
+		}
+	}
+	return installedFile(installed)
+}
+
 // installedFile checks the file a plan names the change installed in, when it names one: an absolute path, or one
 // under ~/, of a regular file that is there.
 func installedFile(installed string) error {
@@ -207,18 +224,7 @@ func installedFile(installed string) error {
 // evidence in the gate is refused before any guard is tried, and so is a gate that holds the problem and none of the
 // case's evidence.
 func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window time.Duration, installed string, at time.Time) (Plan, error) {
-	switch {
-	case sig.Source == "" || len(sig.Kinds) == 0 || len(sig.Match) == 0:
-		return Plan{}, refused("a measurement signal names a source, kinds and at least one text its events hold")
-	case !measure.WholeWeeks(window):
-		return Plan{}, refused("a measurement window is a whole number of weeks (7d, 14d and so on)")
-	}
-	for _, m := range sig.Match {
-		if len(strings.TrimSpace(m)) < 4 {
-			return Plan{}, refused("the signal's text %q is too short to name a problem", m)
-		}
-	}
-	if err := installedFile(installed); err != nil {
+	if err := planShape(sig, window, installed); err != nil {
 		return Plan{}, err
 	}
 	now := at // the proposal's own time: the readers that stopped are those that have not run for a window up to it, and the span is the four windows before it

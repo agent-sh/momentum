@@ -394,15 +394,18 @@ func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
 		own       []string
 		counted   bool
 		root      bool
-		evidence  bool
+		logged    string // a case log line a person writes after the check
 		detectors string
+		noSignal  bool
 		want      string
 	}{
 		"its replay plan":                         {want: "detector fix"},
 		"its replay plan, with a root cause":      {root: true, want: "detector fix"},
 		"a replay keyed for other signatures":     {own: []string{"failures/v1:another"}, want: "lapsed"},
-		"evidence a person filed after the check": {evidence: true, want: "lapsed"},
+		"evidence a person filed after the check": {logged: "evidence", want: "lapsed"},
+		"a case a person reopened":                {logged: "reopened", want: "lapsed"},
 		"detectors its replay never read":         {detectors: strings.Repeat("0", 40), want: "lapsed"},
+		"no count stands at its landing":          {detectors: strings.Repeat("0", 40), noSignal: true, want: "held"},
 		"a counted plan with a covering replay":   {counted: true, want: "measuring"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -413,8 +416,8 @@ func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if c.evidence {
-				if err := m.st.CaseNote(ctx, m.c.ID, "evidence", "1 filed by hand", "owner"); err != nil {
+			if c.logged != "" {
+				if err := m.st.CaseNote(ctx, m.c.ID, c.logged, "by hand", "owner"); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -431,6 +434,9 @@ func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
 			p.Repo, p.Landed = SelfRepo, []string{head}
 			if !c.counted {
 				p.Plan = &Plan{Signal: goodSignal, Window: 7 * 24 * time.Hour, At: m.planAt, Replay: true}
+				if c.noSignal {
+					p.Plan.Signal = Signal{}
+				}
 			}
 			sigs := m.c.Signatures
 			if c.own != nil {
@@ -445,8 +451,10 @@ func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
 			cs := m.theCase(t)
 			kept, _, _ := m.r.Ship.Load(m.c.ID)
 			switch c.want {
-			case "lapsed":
-				if got.Status != "waiting" && got.Status != "held" || kept.Plan.Replay || cs.Status != store.CaseDeployed {
+			case "lapsed", "held":
+				// counted again at the landing, or, when no count stands there, measured by hand
+				if got.Status != "waiting" && got.Status != "held" || c.want == "held" && (got.Status != "held" || kept.Plan.Units != "") ||
+					kept.Plan.Replay || cs.Status != store.CaseDeployed {
 					t.Fatalf("a lapsed replay plan: measured %+v, plan %+v, case %s", got, kept.Plan, cs.Status)
 				}
 			case "detector fix":
