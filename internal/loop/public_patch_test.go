@@ -71,7 +71,7 @@ func TestPublicPatchAdmitsReservedHostsAndAddresses(t *testing.T) {
 		"ssh build-box.test; ping host.invalid; open http://app.localhost:3000/ and http://localhost.",
 		"dial [2001:db8::5]:443, [2001:DB8:1::7]:80, [::1]:8080 and 127.10.0.1",
 		"dial 2001:db8::192.0.2.1 or ::ffff:192.0.2.1; resolve EXAMPLE.COM and a.b.test.",
-		"listen: 192.0.2.1:8080, host:198.51.100.2 and [2001:db8::1]:443",
+		"listen: 192.0.2.1:8080, host:198.51.100.2, code:192.0.2.3 and [2001:db8::1]:443",
 	}
 	for _, line := range lines {
 		if err := patchText(ctx, line, "added lines"); err != nil {

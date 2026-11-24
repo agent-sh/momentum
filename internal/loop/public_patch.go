@@ -211,14 +211,20 @@ func blankReserved(text string, re *regexp.Regexp, ipv4 bool, reserved func(matc
 }
 
 // standsAlone says whether text[start:end] is joined to no name around it: no dot, dash or underscore before it,
-// and no dash, underscore or dotted label after it. An IPv4 address after a colon that follows a hex digit or a
-// colon is an IPv6 address's tail, not alone.
+// and no dash, underscore or dotted label after it. An IPv4 address after a colon that follows an IPv6 group (up to
+// four hex digits, or none) is an IPv6 address's tail, not alone.
 func standsAlone(text string, start, end int, ipv4 bool) bool {
 	if start > 0 && strings.IndexByte(".-_", text[start-1]) >= 0 {
 		return false
 	}
-	if ipv4 && start > 0 && text[start-1] == ':' && (start == 1 || text[start-2] == ':' || hexLabel(text[start-2:start-1])) {
-		return false
+	if ipv4 && start > 0 && text[start-1] == ':' {
+		group := start - 1
+		for group > 0 && identifierByte(text[group-1]) {
+			group--
+		}
+		if label := text[group : start-1]; len(label) <= 4 && hexLabel(label) {
+			return false
+		}
 	}
 	if end < len(text) && strings.IndexByte("-_", text[end]) >= 0 {
 		return false
