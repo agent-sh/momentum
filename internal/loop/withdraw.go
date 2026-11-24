@@ -154,7 +154,7 @@ func (s *Ship) requestState(ctx context.Context, c store.Case, p Package, url, s
 	case state == "CLOSED" && len(p.Hand) > 0:
 		// a person who lands a hand landing's head by a push and then closes its request landed it all the same, as
 		// reconcileHand reads it
-		if _, _, landed, err := s.landedByContent(ctx, p, head); err != nil {
+		if _, _, _, landed, err := s.landedByContent(ctx, p, head); err != nil {
 			return "", "", err
 		} else if landed {
 			return "", "", refused("case %s's pull request %s was closed, and %s holds its change as proposed: a hand landing, whose landing the next pass records", c.ID, url, p.Base)

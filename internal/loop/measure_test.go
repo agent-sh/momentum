@@ -380,21 +380,34 @@ func TestAPlanWithoutItsTimeOrUnitsMeasuresNothing(t *testing.T) {
 }
 
 // A detector fix's plan is its replay (replayPlan): it counts no signal, and once its change is in effect the case
-// closes as a detector fix, never as improved.
+// closes as a detector fix, never as improved. A case that took a signature after the check, which the replay never
+// keyed for, is held for a person.
 func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
-	m := measuredCase(t)
-	p, _, _ := m.r.Ship.Load(m.c.ID)
-	p.Plan = &Plan{Signal: goodSignal, Window: 7 * 24 * time.Hour, At: m.planAt, Replay: true}
-	p.Check = &Check{Replay: &SelfReplay{Diff: rekey.Diff{Before: 6, Dropped: []rekey.Count{{Signature: m.c.Signatures[0], N: 6}}},
-		Own: m.c.Signatures}}
-	if err := m.r.Ship.save(&p); err != nil {
-		t.Fatal(err)
-	}
-	if got := m.measure(t, Options{}); got.Status != "detector fix" {
-		t.Fatalf("a detector fix's replay plan: %+v", got)
-	}
-	if c := m.theCase(t); c.Status != store.CaseClosed || c.Reason != store.DetectorFix || !strings.Contains(c.Measurement.Effect, "dropped: 6") {
-		t.Fatalf("its case: %+v", c)
+	for _, own := range [][]string{nil, {"failures/v1:another"}} {
+		m := measuredCase(t)
+		p, _, _ := m.r.Ship.Load(m.c.ID)
+		p.Changed = []string{"internal/detect/failures.go", "internal/detect/detect_test.go"}
+		p.Plan = &Plan{Signal: goodSignal, Window: 7 * 24 * time.Hour, At: m.planAt, Replay: true}
+		sigs := m.c.Signatures
+		if own != nil {
+			sigs = own
+		}
+		p.Check = &Check{Replay: &SelfReplay{Diff: rekey.Diff{Before: 6, Dropped: []rekey.Count{{Signature: m.c.Signatures[0], N: 6}}},
+			Own: sigs}}
+		if err := m.r.Ship.save(&p); err != nil {
+			t.Fatal(err)
+		}
+		got := m.measure(t, Options{})
+		c := m.theCase(t)
+		if own != nil {
+			if got.Status != "held" || c.Status != store.CaseDeployed {
+				t.Fatalf("a replay keyed for other signatures: %+v, case %s", got, c.Status)
+			}
+			continue
+		}
+		if got.Status != "detector fix" || c.Status != store.CaseClosed || c.Reason != store.DetectorFix || !strings.Contains(c.Measurement.Effect, "dropped: 6") {
+			t.Fatalf("a detector fix's replay plan: %+v, case %+v", got, c)
+		}
 	}
 }
 

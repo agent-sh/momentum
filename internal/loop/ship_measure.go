@@ -89,7 +89,9 @@ func (s *Ship) deploymentReceipt(ctx context.Context, p Package) error {
 	window := ""
 	if p.Plan != nil {
 		window = " Measured over the " + days(p.Plan.Window) + " after it is in effect."
-		if g := p.Plan.Guard; g != nil && p.Plan.Units != "" {
+		if p.Plan.Replay {
+			window = " Judged by its detector replay, not measured: it closes as a detector fix once it is in effect."
+		} else if g := p.Plan.Guard; g != nil && p.Plan.Units != "" {
 			window = fmt.Sprintf(" Guarded, not measured: it watches %s for a recurrence from when it first takes effect; %d incidents in %d %s before it. One recurrence brings the case back; no recurrence closes it as guarded, with P, had the problem kept happening. A problem that stopped by itself shows the same.",
 				days(guardRetention), g.Incidents, g.Exposure, p.Plan.Units)
 		}

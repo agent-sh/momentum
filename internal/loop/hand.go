@@ -230,17 +230,18 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 		if at.IsZero() {
 			at = s.now()
 		}
-		return p, s.landHand(ctx, c, &p, pr.MergeCommit.OID, at)
+		checked := pr.Head != "" && (pr.Head == p.Head || pr.Head == p.PublishedHead)
+		return p, s.landHand(ctx, c, &p, pr.MergeCommit.OID, at, checked)
 	case "CLOSED":
 		// a person who lands a rebased head by a push to the default branch and then closes the request landed it all
 		// the same: the change's files on the default branch as the proposal has them say so
-		if commit, at, landed, err := s.landedByContent(ctx, p, pr.Head); err != nil {
+		if commit, at, head, landed, err := s.landedByContent(ctx, p, pr.Head); err != nil {
 			return p, err
 		} else if landed {
 			if err := s.caseNoteOnce(ctx, caseID, "landed by content", fmt.Sprintf("%s was closed, and %s holds its change's files as proposed at %s", p.PR, p.Base, commit)); err != nil {
 				return p, err
 			}
-			return p, s.landHand(ctx, c, &p, commit, at)
+			return p, s.landHand(ctx, c, &p, commit, at, head == firstOf(p.Head, p.PublishedHead))
 		}
 		p.State = Withdrawn
 		p.ClosedProposals++
@@ -342,8 +343,9 @@ func (s *Ship) caseNoteOnce(ctx context.Context, id, action, detail string) erro
 // landHand records a hand landing at commit, a commit of the default branch, landed at at. A plan counted more than a
 // window before the landing no longer stands for the windows before the change: it is counted again as of the
 // landing. A count that waits on a reader holds the landing for the next pass; one refused leaves the change to be
-// measured by hand (a plan without units), with a case log line that says why.
-func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit string, at time.Time) error {
+// measured by hand (a plan without units), with a case log line that says why. checked says whether what landed is
+// the head the loop checked: a replay plan judges the tree its replay read, so another head is measured by hand.
+func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit string, at time.Time, checked bool) error {
 	if p.Plan != nil && !p.Plan.Replay && at.Sub(p.Plan.At) > p.Plan.Window { // a replay plan counts nothing to count again
 		plan, err := s.validPlan(ctx, c, p.Plan.Signal, p.Plan.Window, p.Plan.Installed, at)
 		var wait *waitingPlan
@@ -377,6 +379,12 @@ func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit st
 			}
 		}
 	}
+	if p.Plan != nil && p.Plan.Replay && !checked {
+		p.Plan.Replay, p.Plan.Units = false, ""
+		if err := s.caseNoteOnce(ctx, c.ID, "measured by hand", "landed by hand from another head than the one its detector replay read: what landed was never replayed, so a person measures it"); err != nil {
+			return err
+		}
+	}
 	p.State, p.LandingHead, p.Landed, p.Cleanup, p.LandedAt = Landed, commit, []string{commit}, "", at
 	if err := s.saveAuthorized(ctx, p); err != nil {
 		return err
@@ -385,13 +393,14 @@ func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit st
 }
 
 // landedByContent says whether the fetched default branch holds every file the change touches as the proposal's head
-// has it (a deleted file deleted), and if so the newest commit of the branch that touched them and its time.
-func (s *Ship) landedByContent(ctx context.Context, p Package, requestHead string) (string, time.Time, bool, error) {
+// has it (a deleted file deleted), and if so the newest commit of the branch that touched them, its time and the head
+// whose files it holds: the loop's, or the request's own when a person pushed another.
+func (s *Ship) landedByContent(ctx context.Context, p Package, requestHead string) (string, time.Time, string, bool, error) {
 	if firstOf(p.Head, p.PublishedHead) == "" || len(p.Changed) == 0 {
-		return "", time.Time{}, false, nil
+		return "", time.Time{}, "", false, nil
 	}
 	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
-		return "", time.Time{}, false, err
+		return "", time.Time{}, "", false, err
 	}
 	heads := []string{firstOf(p.Head, p.PublishedHead)}
 	if n := prNumber(p.PR); commitRe.MatchString(requestHead) && requestHead != heads[0] && n != "" {
@@ -403,10 +412,10 @@ func (s *Ship) landedByContent(ctx context.Context, p Package, requestHead strin
 	for _, head := range heads {
 		commit, at, landed, err := s.holdsFiles(ctx, p, head)
 		if err != nil || landed {
-			return commit, at, landed, err
+			return commit, at, head, landed, err
 		}
 	}
-	return "", time.Time{}, false, nil
+	return "", time.Time{}, "", false, nil
 }
 
 // prNumber is a pull request URL's number, or "".

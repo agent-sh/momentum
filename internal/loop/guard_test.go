@@ -42,12 +42,18 @@ func toolResult(key string, at time.Time, session string, failed bool) store.Eve
 // testingCaseOf is a case in testing of the tool's failures, its evidence the events given.
 func testingCaseOf(t *testing.T, st *store.Store, signature string, evidence []store.Event) store.Case {
 	t.Helper()
+	return testingCaseBy(t, st, signature, evidence, "test")
+}
+
+// testingCaseBy is testingCaseOf, the case opened by the actor.
+func testingCaseBy(t *testing.T, st *store.Store, signature string, evidence []store.Event, actor string) store.Case {
+	t.Helper()
 	ctx := context.Background()
 	f := store.Finding{Family: "failures", Signature: signature, Title: "the tool fails"}
 	for _, e := range evidence {
 		f.Evidence = append(f.Evidence, store.Evidence{Ref: "ev:" + e.ID()})
 	}
-	c, _, err := st.ObserveCase(ctx, f, "test")
+	c, _, err := st.ObserveCase(ctx, f, actor)
 	if err != nil {
 		t.Fatal(err)
 	}

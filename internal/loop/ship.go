@@ -1002,7 +1002,7 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 		return p, refused("a proposal needs its rollback: how the change is undone")
 	}
 	var plan Plan
-	replay, err := replayPlan(c, p, paths, pr, s.now())
+	replay, err := s.replayPlan(ctx, c, p, paths, pr, s.now())
 	if err != nil {
 		return p, err
 	}
@@ -1182,7 +1182,9 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 	}
 	p.State = Proposed
 	line := fmt.Sprintf("%s %s; measured in %s: %d of %d in the baseline; gate %d of %d", p.PR, title, plan.Units, plan.Before, plan.BeforeBase, plan.Gate, plan.GateBase)
-	if g := plan.Guard; g != nil {
+	if plan.Replay {
+		line = fmt.Sprintf("%s %s; judged by its detector replay, not counted (%s); it closes as a detector fix once in effect", p.PR, title, p.Check.Replay.Summary())
+	} else if g := plan.Guard; g != nil {
 		line = fmt.Sprintf("%s %s; guarded in %s: %d incidents in %d of exposure; it watches %s for a recurrence; a problem that stopped by itself shows the same",
 			p.PR, title, plan.Units, g.Incidents, g.Exposure, days(guardRetention))
 	}

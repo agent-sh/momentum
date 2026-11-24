@@ -262,8 +262,12 @@ func (r *Runner) measureFailure(ctx context.Context, c store.Case, err error, dr
 }
 
 func (r *Runner) legacyPlan(ctx context.Context, c store.Case, dry bool) Measured {
-	m := Measured{Case: c.ID, Title: c.Title, Status: "held",
-		Why: "its plan has no time it was counted at or no units: it must be measured by hand"}
+	return r.byHand(ctx, c, "its plan has no time it was counted at or no units: it must be measured by hand", dry)
+}
+
+// byHand holds a case whose plan the step cannot measure, with a note that says why: a person measures it.
+func (r *Runner) byHand(ctx context.Context, c store.Case, why string, dry bool) Measured {
+	m := Measured{Case: c.ID, Title: c.Title, Status: "held", Why: why}
 	if !dry {
 		if err := r.noteStepSkip(ctx, c, "measure", "plan", m.Why); err != nil {
 			r.logf("legacy measurement note: %v", err)
@@ -317,7 +321,7 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	case p.Plan.At.IsZero() || p.Plan.Units == "" && !p.Plan.Replay:
 		return r.legacyPlan(ctx, c, dry)
 	case p.Plan.Replay && (p.Check == nil || p.Check.Replay == nil):
-		return failed("its plan is its check's detector replay, and the package holds no replay")
+		return r.byHand(ctx, c, "its plan is its check's detector replay, and the package holds no replay: it must be measured by hand", dry)
 	}
 	if p.Plan.Guard != nil && c.Status == store.CaseMeasuring {
 		// a guard's recurrence counts from its watch's first start, from the plan the proposal recorded, before any
@@ -393,17 +397,16 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 			r.resolve(ctx, &p)
 		}
 	}
-	if c.Status == store.CaseDeployed && p.Check != nil && p.Check.Replay != nil {
-		// only a change that moved every one of the case's own events: one that left some keyed as they were has not
-		// moved the case's whole problem, and its measurement reads the rest
-		if rekeyed, dropped := p.Check.Replay.Diff.Touches(c.Signatures); rekeyed+dropped > 0 && p.Check.Replay.OwnKept == 0 {
-			return r.detectorFixed(ctx, c, &p, m, rekeyed, dropped, dry)
-		}
+	if c.Status == store.CaseDeployed && p.Check != nil && detectorConfined(p.Changed) && replayCovers(p.Check.Replay, c.Signatures) {
+		// only a change confined to the detectors that moved every one of the case's own events: one that left some
+		// keyed as they were has not moved the case's whole problem, and its measurement reads the rest
+		rekeyed, dropped := p.Check.Replay.Diff.Touches(c.Signatures)
+		return r.detectorFixed(ctx, c, &p, m, rekeyed, dropped, dry)
 	}
 	if plan.Replay {
-		// the case's signatures changed since its proposal, and its replay no longer moves all of their events: there is
-		// no count to fall back on, so a person decides
-		return failed("its plan is its check's detector replay, which no longer moves every event of the case's signatures")
+		// the case's signatures changed since its proposal, and its replay no longer covers them: there is no count to
+		// fall back on, so a person decides
+		return r.byHand(ctx, c, "its plan is its check's detector replay, which no longer covers the case's signatures: it must be measured by hand", dry)
 	}
 	if c.Status == store.CaseDeployed || plan.Guard == nil && !p.OutOfEffect.IsZero() {
 		m.Status, m.Due = "measuring", since.Add(plan.Window)

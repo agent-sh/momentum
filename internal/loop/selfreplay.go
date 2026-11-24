@@ -45,27 +45,17 @@ func (r SelfReplay) Summary() string {
 // up to the end of the store's copy.
 const ReplayWindow = detect.DefaultWindow
 
-// replayPlan is the plan of a detector fix: a change of the loop's own repository confined to its detectors
-// (internal/detect/; of the frame there the replay does not read, selfHand, only test files), whose check's
-// replay re-keyed or dropped the case's own events and kept none of them keyed as the base keys them. Such a case's
-// problem is the detector's own keying: no forward count of the signal measures it, and the replay, which refused any
-// move of another signature's events, is its measure. The plan counts nothing and closes the case as a detector fix
-// once the change is in effect (Runner.detectorFixed). Any other change gets nil, and its plan is counted (validPlan).
-func replayPlan(c store.Case, p Package, changed []string, pr Proposal, at time.Time) (*Plan, error) {
-	if p.Kind == KindConfig || !strings.EqualFold(p.Repo, SelfRepo) || p.Check == nil || p.Check.Replay == nil || len(changed) == 0 {
+// replayPlan is the plan of a detector fix (replayJudged): such a case's problem is the detector's own keying, which
+// no forward count of a signal measures, and the replay, which refused any move of another signature's events, is its
+// measure. The plan counts nothing and closes the case as a detector fix once the change is in effect
+// (Runner.detectorFixed). Any other change gets nil, and its plan is counted (validPlan).
+func (s *Ship) replayPlan(ctx context.Context, c store.Case, p Package, changed []string, pr Proposal, at time.Time) (*Plan, error) {
+	if !replayJudged(c, p, changed) {
 		return nil, nil
 	}
-	for _, path := range changed {
-		if !slices.ContainsFunc(replayed, func(dir string) bool { return inPath(path, dir) }) {
-			return nil, nil
-		}
-		if !strings.HasSuffix(path, "_test.go") && slices.ContainsFunc(selfHand, func(h string) bool { return inPathFold(path, h) }) {
-			return nil, nil
-		}
-	}
-	r := p.Check.Replay
-	if rekeyed, dropped := r.Diff.Touches(c.Signatures); rekeyed+dropped == 0 || r.OwnKept > 0 {
-		return nil, nil
+	// evidence filed by hand, or merged from another case, may be events no detector keyed: those are counted
+	if opened, err := s.runner().detectorOpened(ctx, c); err != nil || !opened {
+		return nil, err
 	}
 	if !measure.WholeWeeks(pr.Window) {
 		return nil, refused("a measurement window is a whole number of weeks (7d, 14d and so on)")
@@ -74,6 +64,46 @@ func replayPlan(c store.Case, p Package, changed []string, pr Proposal, at time.
 		return nil, err
 	}
 	return &Plan{Signal: pr.Signal, Window: pr.Window, At: at, Installed: pr.Installed, Replay: true}, nil
+}
+
+// replayJudged says whether a package's change is judged by its check's detector replay: a change of the loop's own
+// repository confined to its detectors (detectorConfined), whose replay covers the case's signatures (replayCovers).
+func replayJudged(c store.Case, p Package, changed []string) bool {
+	return p.Kind != KindConfig && strings.EqualFold(p.Repo, SelfRepo) && p.Check != nil && detectorConfined(changed) &&
+		replayCovers(p.Check.Replay, c.Signatures)
+}
+
+// detectorConfined says whether every path is under the detectors (internal/detect/) and none, but a test file, is
+// of the detectors' frame there (selfHand), which the replay does not read.
+func detectorConfined(changed []string) bool {
+	if len(changed) == 0 {
+		return false
+	}
+	for _, path := range changed {
+		if !slices.ContainsFunc(replayed, func(dir string) bool { return inPath(path, dir) }) {
+			return false
+		}
+		if !strings.HasSuffix(path, "_test.go") && slices.ContainsFunc(selfHand, func(h string) bool { return inPathFold(path, h) }) {
+			return false
+		}
+	}
+	return true
+}
+
+// replayCovers says whether a replay moved the whole of the case's problem: each of the signatures is one the replay
+// was keyed for (a signature the case took after its check is not in what it kept), it re-keyed or dropped their
+// events, and it kept none of them keyed as the base keys them.
+func replayCovers(r *SelfReplay, sigs []string) bool {
+	if r == nil || len(sigs) == 0 || r.OwnKept > 0 {
+		return false
+	}
+	for _, sig := range sigs {
+		if !slices.Contains(r.Own, sig) {
+			return false
+		}
+	}
+	rekeyed, dropped := r.Diff.Touches(sigs)
+	return rekeyed+dropped > 0
 }
 
 // replayDst is where a replay reads the store's copy in its sandbox.
@@ -92,19 +122,30 @@ func replayCmd(since, until time.Time) []string {
 // may key the case's own events otherwise and stop keying them, whose own investigation says they are no failures; a
 // change that re-keys or stops keying events of any other signature would make another case read its problem gone,
 // or failures disappear with no evidence that they were false positives, and is refused. A change with no replayed
-// detector path, or in another repository, replays nothing. A detector path a person lands for what the change does
-// to it (selfScope) is replayed all the same when a store copy is here: the replay is how the change is judged
-// (replayPlan), not who lands it; with no copy, such a change is a person's and is measured forward.
+// detector path, or in another repository, replays nothing. A change whose detector paths are all a person's to land
+// for what it does there (selfScope) is replayed too when a store copy is here, since the replay may judge it
+// (replayPlan); with no copy, or a replay that refuses it, it is a person's as before and its plan is counted.
 func (s *Ship) selfReplay(ctx context.Context, p Package, tree string, changed, hand []string) (*SelfReplay, error) {
 	if !strings.EqualFold(p.Repo, SelfRepo) || !slices.ContainsFunc(changed, isReplayed) {
 		return nil, nil
 	}
-	if s.ReplayStore == "" && !slices.ContainsFunc(changed, func(c string) bool { return isReplayed(c) && !slices.Contains(hand, c) }) {
-		return nil, nil
-	}
+	lands := slices.ContainsFunc(changed, func(c string) bool { return isReplayed(c) && !slices.Contains(hand, c) })
 	if s.ReplayStore == "" {
+		if !lands {
+			return nil, nil
+		}
 		return nil, refused("a change to the loop's own detectors is replayed over a copy of the store, and none is here: a loop pass checks it")
 	}
+	r, err := s.replayOver(ctx, p, tree)
+	if err != nil && !lands && errors.Is(err, ErrRefused) {
+		s.logf("case %s: its detector change is a person's to land, and its plan is counted: %v", p.Case, err)
+		return nil, nil
+	}
+	return r, err
+}
+
+// replayOver keys the last ReplayWindow of the store's copy with the base's detectors and the change's (selfReplay).
+func (s *Ship) replayOver(ctx context.Context, p Package, tree string) (*SelfReplay, error) {
 	src, err := filepath.EvalSymlinks(s.ReplayStore)
 	if err != nil {
 		return nil, err

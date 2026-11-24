@@ -77,12 +77,18 @@ const (
 // the replay's stand-in, with a package prepared for a case of ownSig, and a store copy to replay over.
 func replayFixture(t *testing.T) (*Ship, store.Case, Package) {
 	t.Helper()
+	return replayFixtureBy(t, "test")
+}
+
+// replayFixtureBy is replayFixture, its case opened by the actor.
+func replayFixtureBy(t *testing.T, actor string) (*Ship, store.Case, Package) {
+	t.Helper()
 	st := testStore(t)
 	f := newRepo(t, map[string]string{"internal/measure/rekey/replay/main.go": replayStandIn, keysPath: keysBase,
 		"internal/detect/failures.go": detectGo})
 	s := shipFor(t, st, f)
 	s.Gate.Resolve = func(context.Context, string) (string, error) { return SelfRepo, nil }
-	c := testingCaseOf(t, st, ownSig, nil)
+	c := testingCaseBy(t, st, ownSig, nil, actor)
 	p, err := s.Prepare(context.Background(), c.ID, f.main)
 	if err != nil {
 		t.Fatal(err)
@@ -155,20 +161,23 @@ func TestADetectorChangeWithNoStoreCopyIsAPersonsToLand(t *testing.T) {
 // A detector fix, a change confined to internal/detect/ whose replay moved every event of its case's own signatures,
 // is proposed on its replay: no signal is counted for it, as the case's problem is the detector's keying, and that
 // holds when a path of it is a person's to land for what the change does there. A detector change that left some of
-// the case's events keyed as they were still needs a plan the store counts.
+// the case's events keyed as they were, or a case the detectors did not open alone, still needs a plan the store
+// counts (here one that waits on the store's reads).
 func TestADetectorFixIsProposedOnItsReplayNotACount(t *testing.T) {
 	ctx := context.Background()
 	for name, c := range map[string]struct {
 		keys   string
 		hand   bool
+		actor  string
 		replay bool
 	}{
-		"its own events dropped":                     {"e3 " + otherSig + "\n", false, true},
-		"its own events dropped, landed by a person": {"e3 " + otherSig + "\n", true, true},
-		"some of its own events keyed as they were":  {"e1 failures/v2:tool:read:own:path\ne2 " + ownSig + "\ne3 " + otherSig + "\n", false, false},
+		"its own events dropped":                     {"e3 " + otherSig + "\n", false, DetectorActor, true},
+		"its own events dropped, landed by a person": {"e3 " + otherSig + "\n", true, DetectorActor, true},
+		"some of its own events keyed as they were":  {"e1 failures/v2:tool:read:own:path\ne2 " + ownSig + "\ne3 " + otherSig + "\n", false, DetectorActor, false},
+		"a case a person opened":                     {"e3 " + otherSig + "\n", false, "owner", false},
 	} {
 		t.Run(name, func(t *testing.T) {
-			s, cs, p := replayFixture(t)
+			s, cs, p := replayFixtureBy(t, c.actor)
 			if c.hand {
 				// every path a person's to land: the detector adds a package variable whose value runs code (selfKept),
 				// and its test is the detectors' frame's; the detector holds its keys
@@ -189,8 +198,8 @@ func TestADetectorFixIsProposedOnItsReplayNotACount(t *testing.T) {
 			p, err = proposePatch(t, s, ctx, cs.ID, Proposal{Title: "Key the read failure by its path", Body: "The detector keys it otherwise.",
 				Rollback: "Revert the commit.", Signal: goodSignal, Window: 7 * 24 * time.Hour})
 			if !c.replay {
-				if err == nil || p.Plan != nil && p.Plan.Replay {
-					t.Fatalf("a change that left its case's events keyed was proposed without a count: %+v", p.Plan)
+				if wait := (*waitingPlan)(nil); !errors.As(err, &wait) || p.Plan == nil || p.Plan.Replay {
+					t.Fatalf("a change its replay does not judge was proposed without a counted plan: %+v: %v", p.Plan, err)
 				}
 				return
 			}
@@ -198,5 +207,24 @@ func TestADetectorFixIsProposedOnItsReplayNotACount(t *testing.T) {
 				t.Fatalf("a detector fix's proposal: plan %+v head %q: %v", p.Plan, p.Head, err)
 			}
 		})
+	}
+}
+
+// A hand landing of the head the loop checked keeps its replay plan; one of another head, which its replay never read,
+// is measured by hand.
+func TestAHandLandingOfAnotherHeadIsNotJudgedByTheReplay(t *testing.T) {
+	ctx := context.Background()
+	for _, checked := range []bool{true, false} {
+		s, c, _, p := proposedHand(t)
+		p.Plan.Replay, p.Plan.Units = true, ""
+		if err := s.save(&p); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.landHand(ctx, c, &p, p.Head, time.Now(), checked); err != nil {
+			t.Fatal(err)
+		}
+		if got, _, _ := s.Load(c.ID); got.State != Landed || got.Plan.Replay != checked {
+			t.Fatalf("landed the checked head %v: state %s, replay plan %v", checked, got.State, got.Plan.Replay)
+		}
 	}
 }
