@@ -33,8 +33,11 @@ type SelfReplay struct {
 	// OwnSeen are the case's signatures the base keyed events of in the window: a signature with none there, the
 	// replay says nothing of.
 	OwnSeen []string `json:"own_seen,omitempty"`
-	// Paths are the paths the replayed change touches: what the replay read, for the judgment of it (replayJudged).
+	// Paths are the paths the replayed change touches: what the replay read, for the judgment of it (replayJudges).
 	Paths []string `json:"paths,omitempty"`
+	// Detectors is the change's tree of internal/detect/: the detectors the replay read. A landing whose detectors
+	// differ (a base that moved, another head) lands what no replay read.
+	Detectors string `json:"detectors,omitempty"`
 }
 
 // Summary is the replay in counts, for the case's log, the check's note and the review: no signature's text, which
@@ -72,7 +75,7 @@ func (s *Ship) replayPlan(ctx context.Context, c store.Case, p Package, pr Propo
 // for a case the detectors opened and filed all the evidence of (detectorOpened): evidence filed by hand, or merged
 // from another case, may be events no detector keyed, and those are counted.
 func (s *Ship) replayJudges(ctx context.Context, c store.Case, p Package) (bool, error) {
-	if p.Kind == KindConfig || !strings.EqualFold(p.Repo, SelfRepo) || p.Check == nil || p.Check.Replay == nil ||
+	if p.Kind == KindConfig || !strings.EqualFold(p.Repo, SelfRepo) || p.Check == nil || p.Check.Replay == nil || p.Check.Replay.Detectors == "" ||
 		!detectorConfined(p.Check.Replay.Paths) || !replayCovers(p.Check.Replay, c.Signatures) {
 		return false, nil
 	}
@@ -123,7 +126,7 @@ func replayCovers(r *SelfReplay, sigs []string) bool {
 		}
 	}
 	rekeyed, dropped := r.Diff.Touches(sigs)
-	return rekeyed+dropped > 0
+	return rekeyed+dropped >= detectorFixFloor // a finding's least, as a detector fix the store shows needs
 }
 
 // symptoms are a case's signatures a detector keys: all but its root causes' (store.RootPrefix), which a build adds
@@ -220,6 +223,9 @@ func (s *Ship) replayOver(ctx context.Context, p Package, tree string, changed [
 	}
 	r := &SelfReplay{Since: since, Until: until, Diff: rekey.Compare(keys[0], keys[1]), Own: slices.Clone(c.Signatures),
 		OwnKept: rekey.Kept(keys[0], keys[1], c.Signatures), Paths: slices.Clone(changed)}
+	if detectors, err := s.git(ctx, p.Host, "rev-parse", tree+":"+strings.TrimSuffix(replayed[0], "/")); err == nil {
+		r.Detectors = strings.TrimSpace(detectors)
+	}
 	for _, sig := range c.Signatures {
 		for _, keyed := range keys[0] {
 			if keyed == sig {

@@ -69,7 +69,7 @@ const (
 	ownSig   = "failures/v2:tool:read:own"
 	otherSig = "failures/v2:tool:bash:other"
 	keysPath = "internal/detect/testdata/keys.txt"
-	keysBase = "e1 " + ownSig + "\ne2 " + ownSig + "\ne3 " + otherSig + "\n"
+	keysBase = "e1 " + ownSig + "\ne2 " + ownSig + "\ne3 " + otherSig + "\ne4 " + ownSig + "\n"
 	detectGo = "package detect\n\n// Version is the keying's version.\nfunc Version() int { return 1 }\n"
 	detectT  = "package detect\n\nimport \"testing\"\n\nfunc TestVersionIsTwo(t *testing.T) {\n\tif Version() != 2 {\n\t\tt.Fatal(Version())\n\t}\n}\n"
 )
@@ -117,8 +117,8 @@ func TestADetectorChangeIsReplayedOverTheStoredHistory(t *testing.T) {
 		refused          bool
 		rekeyed, dropped int
 	}{
-		"its own events keyed otherwise": {"e1 failures/v2:tool:read:own:path\ne2 " + ownSig + "\ne3 " + otherSig + "\n", false, 1, 0},
-		"its own events dropped":         {"e3 " + otherSig + "\n", false, 0, 2},
+		"its own events keyed otherwise": {"e1 failures/v2:tool:read:own:path\ne2 " + ownSig + "\ne3 " + otherSig + "\ne4 " + ownSig + "\n", false, 1, 0},
+		"its own events dropped":         {"e3 " + otherSig + "\n", false, 0, 3},
 		"another case's events dropped":  {"e1 " + ownSig + "\ne2 " + ownSig + "\n", true, 0, 1},
 		"another case's events re-keyed": {"e1 " + ownSig + "\ne2 " + ownSig + "\ne3 failures/v2:tool:bash:moved\n", true, 0, 0},
 	} {
@@ -208,25 +208,6 @@ func TestADetectorFixIsProposedOnItsReplayNotACount(t *testing.T) {
 				t.Fatalf("a detector fix's proposal: plan %+v head %q: %v", p.Plan, p.Head, err)
 			}
 		})
-	}
-}
-
-// A hand landing of the head the loop checked keeps its replay plan; one of another head, which its replay never read,
-// is measured by hand.
-func TestAHandLandingOfAnotherHeadIsNotJudgedByTheReplay(t *testing.T) {
-	ctx := context.Background()
-	for _, checked := range []bool{true, false} {
-		s, c, _, p := proposedHand(t)
-		p.Plan.Replay, p.Plan.Units = true, ""
-		if err := s.save(&p); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.landHand(ctx, c, &p, p.Head, time.Now(), checked); err != nil {
-			t.Fatal(err)
-		}
-		if got, _, _ := s.Load(c.ID); got.State != Landed || got.Plan.Replay != checked {
-			t.Fatalf("landed the checked head %v: state %s, replay plan %v", checked, got.State, got.Plan.Replay)
-		}
 	}
 }
 

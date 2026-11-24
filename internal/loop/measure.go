@@ -265,6 +265,43 @@ func (r *Runner) legacyPlan(ctx context.Context, c store.Case, dry bool) Measure
 	return r.byHand(ctx, c, "its plan has no time it was counted at or no units: it must be measured by hand", dry)
 }
 
+// replayLapsed takes up a replay plan its replay no longer judges: the plan is counted again at the landing, as a late
+// hand landing's is (landHand), and measured from the next pass, or, when no count can stand at the landing, measured
+// by hand. The step's own case log says which.
+func (r *Runner) replayLapsed(ctx context.Context, c store.Case, p *Package, m Measured, why string, dry bool) Measured {
+	plan, err := r.Ship.validPlan(ctx, c, p.Plan.Signal, p.Plan.Window, p.Plan.Installed, p.LandedAt)
+	if err != nil && !errors.Is(err, ErrRefused) {
+		m.Status, m.Why = "failed", err.Error() // a store that could not be read decides nothing
+		return m
+	}
+	if err != nil {
+		if !dry {
+			p.Plan.Replay = false
+			if err := r.Ship.save(p); err != nil {
+				m.Status, m.Why = "failed", err.Error()
+				return m
+			}
+			if err := r.Ship.caseNoteOnce(ctx, c.ID, "measured by hand", why+"; its plan counted at its landing was refused: "+err.Error()); err != nil {
+				r.logf("replay plan note: %v", err)
+			}
+		}
+		return r.byHand(ctx, c, why+": no count stands at its landing, so it must be measured by hand", dry)
+	}
+	m.Status, m.Why = "waiting", why+": its plan is counted again at its landing, and measured from the next pass"
+	if !dry {
+		p.Plan = &plan
+		if err := r.Ship.save(p); err != nil {
+			m.Status, m.Why = "failed", err.Error()
+			return m
+		}
+		if err := r.Ship.caseNoteOnce(ctx, c.ID, "plan counted again", fmt.Sprintf("%s: counted again at its landing, %s, %d of %d in the baseline, gate %d of %d",
+			why, p.LandedAt.UTC().Format(time.RFC3339), plan.Before, plan.BeforeBase, plan.Gate, plan.GateBase)); err != nil {
+			r.logf("replay plan note: %v", err)
+		}
+	}
+	return m
+}
+
 // byHand holds a case whose plan the step cannot measure, with a note that says why: a person measures it.
 func (r *Runner) byHand(ctx context.Context, c store.Case, why string, dry bool) Measured {
 	m := Measured{Case: c.ID, Title: c.Title, Status: "held", Why: why}
@@ -401,13 +438,22 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		// only the plan its replay judged (replayPlan) closes on it, while the replay still judges the case as it is now:
 		// a counted plan is measured as counted. There is no count to fall back on, so anything else is a person's.
 		judged, err := r.Ship.replayJudges(ctx, c, p)
-		switch {
-		case err != nil:
+		if err != nil {
 			return failed(err.Error())
+		}
+		var landed string
+		if judged {
+			if landed, err = r.Ship.git(ctx, p.Dir, "rev-parse", lastOf(p.Landed)+":"+strings.TrimSuffix(replayed[0], "/")); err != nil {
+				return failed(err.Error())
+			}
+		}
+		switch {
 		case !judged:
-			return r.byHand(ctx, c, "its plan is its check's detector replay, which no longer judges the case (its signatures, or evidence not the detectors', came after the check): it must be measured by hand", dry)
+			return r.replayLapsed(ctx, c, &p, m, "its detector replay no longer judges the case (its signatures, or evidence not the detectors', came after the check)", dry)
+		case strings.TrimSpace(landed) != p.Check.Replay.Detectors:
+			return r.replayLapsed(ctx, c, &p, m, "the detectors it landed with are not the ones its replay read (the base moved, or another head landed)", dry)
 		case c.Status != store.CaseDeployed:
-			return r.byHand(ctx, c, "its plan is its check's detector replay, and the case is "+string(c.Status)+", not deployed: it must be measured by hand", dry)
+			return r.replayLapsed(ctx, c, &p, m, "its case is "+string(c.Status)+", not deployed", dry)
 		}
 		rekeyed, dropped := p.Check.Replay.Diff.Touches(symptoms(c.Signatures))
 		return r.detectorFixed(ctx, c, &p, m, rekeyed, dropped, dry)
