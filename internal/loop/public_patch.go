@@ -161,39 +161,45 @@ func reservedAddress(address string) bool {
 	return false
 }
 
-// ipv6DottedRe is ipv6Re with a dotted tail, so a token that runs on into an IPv4 address is read whole.
+// ipv6DottedRe is ipv6Re with a dotted tail and a zone, so a token that runs on into an IPv4 address is read whole.
 var ipv6DottedRe = regexp.MustCompile(`(?i)[a-z0-9_]*:[a-z0-9_:]+(?:\.[a-z0-9_]+)*(?:%[a-z0-9_-]+)?`)
 
 // withoutReserved is text with each reserved address and host (reservedAddress, reservedHost) that stands alone
 // blanked to a space, so every other address and host stays whole for the personal masks: a blank joins nothing to
-// its neighbours. IPv4 addresses go first, so an IPv6 address written with a reserved IPv4 tail is checked by its
-// head; a token that still has a dotted tail after that is left to the masks.
+// its neighbours. An IPv4 address that ends an IPv6 one is read with it, never alone; an IPv6 token with a zone is
+// left to the masks, since a zone names an interface.
 func withoutReserved(text string) string {
-	text = blankReserved(text, ipv4Re, func(match string) (int, bool) {
+	text = blankReserved(text, ipv4Re, true, func(match string) (int, bool) {
 		return 0, reservedAddress(match)
 	})
-	text = blankReserved(text, ipv6DottedRe, func(token string) (int, bool) {
-		keep, address := 0, token
-		if label, rest, ok := strings.Cut(address, ":"); ok && label != "" && !hexLabel(label) {
-			keep, address = len(label)+1, rest
+	text = blankReserved(text, ipv6DottedRe, false, func(token string) (int, bool) {
+		keep, ip := 0, token
+		if label, rest, ok := strings.Cut(ip, ":"); ok && label != "" && !hexLabel(label) {
+			keep, ip = len(label)+1, rest
 		}
-		ip, _, _ := strings.Cut(address, "%")
-		return keep, !strings.Contains(ip, ".") && strings.Contains(ip, ":") && reservedAddress(ip)
+		if strings.Contains(ip, "%") || !strings.Contains(ip, ":") {
+			return keep, false
+		}
+		// an IPv4 tail is reserved itself, or the whole is a mapped or documentation address with a real one in it
+		if tail := ip[strings.LastIndexByte(ip, ':')+1:]; strings.Contains(tail, ".") && !reservedAddress(tail) {
+			return keep, false
+		}
+		return keep, reservedAddress(ip)
 	})
-	return blankReserved(text, hostNameRe, func(host string) (int, bool) {
+	return blankReserved(text, hostNameRe, false, func(host string) (int, bool) {
 		return 0, reservedHost(host)
 	})
 }
 
 // blankReserved is text with each match of re that reserved admits, from the byte reserved says to keep onwards,
-// blanked to a space when it stands alone: not a label or a part of a longer dotted name or identifier.
-func blankReserved(text string, re *regexp.Regexp, reserved func(match string) (keep int, ok bool)) string {
+// blanked to a space when it stands alone (standsAlone).
+func blankReserved(text string, re *regexp.Regexp, ipv4 bool, reserved func(match string) (keep int, ok bool)) string {
 	var out strings.Builder
 	end := 0
 	for _, span := range re.FindAllStringIndex(text, -1) {
 		keep, ok := reserved(text[span[0]:span[1]])
 		start := span[0] + keep
-		if !ok || !standsAlone(text, start, span[1]) {
+		if !ok || !standsAlone(text, start, span[1], ipv4) {
 			continue
 		}
 		out.WriteString(text[end:start])
@@ -205,9 +211,13 @@ func blankReserved(text string, re *regexp.Regexp, reserved func(match string) (
 }
 
 // standsAlone says whether text[start:end] is joined to no name around it: no dot, dash or underscore before it,
-// and no dash, underscore or dotted label after it.
-func standsAlone(text string, start, end int) bool {
+// and no dash, underscore or dotted label after it. An IPv4 address after a colon that follows a hex digit or a
+// colon is an IPv6 address's tail, not alone.
+func standsAlone(text string, start, end int, ipv4 bool) bool {
 	if start > 0 && strings.IndexByte(".-_", text[start-1]) >= 0 {
+		return false
+	}
+	if ipv4 && start > 0 && text[start-1] == ':' && (start == 1 || text[start-2] == ':' || hexLabel(text[start-2:start-1])) {
 		return false
 	}
 	if end < len(text) && strings.IndexByte("-_", text[end]) >= 0 {
