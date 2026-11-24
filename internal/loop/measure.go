@@ -269,7 +269,18 @@ func (r *Runner) legacyPlan(ctx context.Context, c store.Case, dry bool) Measure
 // hand landing's is (landHand), and measured from the next pass, or, when no count can stand at the landing, measured
 // by hand. The step's own case log says which.
 func (r *Runner) replayLapsed(ctx context.Context, c store.Case, p *Package, m Measured, why string, dry bool) Measured {
-	plan, err := r.Ship.validPlan(ctx, c, p.Plan.Signal, p.Plan.Window, p.Plan.Installed, p.LandedAt)
+	// the proposal did not check the signal against the change's words (Propose): a change that rewrites what the
+	// signal counts would measure as a fix, so it is checked here, and one that cannot be checked counts nothing
+	err := errors.New("its package holds no check")
+	if p.Check != nil {
+		err = r.Ship.editsSignal(ctx, *p, p.Plan.Signal)
+	}
+	var plan Plan
+	if err == nil {
+		plan, err = r.Ship.validPlan(ctx, c, p.Plan.Signal, p.Plan.Window, p.Plan.Installed, p.LandedAt)
+	} else {
+		err = refused("%v", err)
+	}
 	var wait *waitingPlan
 	switch {
 	case err != nil && !errors.Is(err, ErrRefused):
@@ -364,7 +375,7 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	case p.Plan.At.IsZero() || p.Plan.Units == "" && !p.Plan.Replay:
 		return r.legacyPlan(ctx, c, dry)
 	case p.Plan.Replay && (p.Check == nil || p.Check.Replay == nil):
-		return r.byHand(ctx, c, "its plan is its check's detector replay, and the package holds no replay: it must be measured by hand", dry)
+		return r.replayLapsed(ctx, c, &p, m, "its plan is its check's detector replay, and the package holds no replay", dry)
 	}
 	if p.Plan.Guard != nil && c.Status == store.CaseMeasuring {
 		// a guard's recurrence counts from its watch's first start, from the plan the proposal recorded, before any
@@ -438,6 +449,13 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 				return failed(err.Error())
 			}
 			r.resolve(ctx, &p)
+		}
+	}
+	if !plan.Replay && c.Status == store.CaseDeployed && p.Check != nil && p.Check.Replay != nil && len(p.Check.Replay.Paths) == 0 {
+		// a package proposed before replay plans, whose replay recorded no paths: closed as those builds closed it, as
+		// a detector fix once its replay moved every event of the case's own and kept none
+		if rekeyed, dropped := p.Check.Replay.Diff.Touches(c.Signatures); rekeyed+dropped > 0 && p.Check.Replay.OwnKept == 0 {
+			return r.detectorFixed(ctx, c, &p, m, rekeyed, dropped, dry)
 		}
 	}
 	if plan.Replay {

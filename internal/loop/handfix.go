@@ -262,8 +262,9 @@ func (r *Runner) detectorOpened(ctx context.Context, c store.Case) (bool, error)
 		case "merged":
 			return false, nil
 		case "reopened", "regressed", "kept closed":
-			// evidence brought to a closed case, or a reopening by hand: someone's but the detectors' is no keying of theirs
-			if e.Actor != DetectorActor {
+			// evidence brought to a closed case, or a reopening by hand: someone's but the detectors' is no keying of
+			// theirs. The measure step's own regression brings no evidence.
+			if e.Actor != DetectorActor && !(e.Action == "regressed" && e.Actor == "loop:measure") {
 				return false, nil
 			}
 		}

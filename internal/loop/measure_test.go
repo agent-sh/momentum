@@ -397,8 +397,10 @@ func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
 		logged    string // a case log line a person writes after the check
 		detectors string
 		noSignal  bool
+		legacy    bool // a package from before replay plans: its replay recorded no paths
 		want      string
 	}{
+		"a package from before replay plans":      {counted: true, legacy: true, want: "detector fix"},
 		"its replay plan":                         {want: "detector fix"},
 		"its replay plan, with a root cause":      {root: true, want: "detector fix"},
 		"a replay keyed for other signatures":     {own: []string{"failures/v1:another"}, want: "lapsed"},
@@ -444,10 +446,13 @@ func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
 			}
 			p.Check = &Check{Replay: &SelfReplay{Diff: rekey.Diff{Before: 6, Dropped: []rekey.Count{{Signature: m.c.Signatures[0], N: 6}}},
 				Own: sigs, OwnSeen: sigs, Paths: []string{"internal/detect/failures.go", "internal/detect/detect_test.go"}, Detectors: detectors}}
+			if c.legacy {
+				p.Check.Replay.Paths, p.Check.Replay.Detectors, p.Check.Replay.OwnSeen = nil, "", nil
+			}
 			if err := m.r.Ship.save(&p); err != nil {
 				t.Fatal(err)
 			}
-			got := m.measure(t, Options{Dry: c.counted})
+			got := m.measure(t, Options{Dry: c.counted && !c.legacy})
 			cs := m.theCase(t)
 			kept, _, _ := m.r.Ship.Load(m.c.ID)
 			switch c.want {
