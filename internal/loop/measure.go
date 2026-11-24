@@ -271,15 +271,13 @@ func (r *Runner) legacyPlan(ctx context.Context, c store.Case, dry bool) Measure
 func (r *Runner) replayLapsed(ctx context.Context, c store.Case, p *Package, m Measured, why string, dry bool) Measured {
 	// the proposal did not check the signal against the change's words (Propose): a change that rewrites what the
 	// signal counts would measure as a fix, so it is checked here, and one that cannot be checked counts nothing
-	err := errors.New("its package holds no check")
+	err := refused("its package holds no check")
 	if p.Check != nil {
 		err = r.Ship.editsSignal(ctx, *p, p.Plan.Signal)
 	}
 	var plan Plan
 	if err == nil {
 		plan, err = r.Ship.validPlan(ctx, c, p.Plan.Signal, p.Plan.Window, p.Plan.Installed, p.LandedAt)
-	} else {
-		err = refused("%v", err)
 	}
 	var wait *waitingPlan
 	switch {

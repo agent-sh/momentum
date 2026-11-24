@@ -428,12 +428,14 @@ func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
 			run(t, m.repo, "git", "add", "-A")
 			run(t, m.repo, "git", "commit", "-q", "-m", "the detector change")
 			head := strings.TrimSpace(run(t, m.repo, "git", "rev-parse", "HEAD"))
+			base := strings.TrimSpace(run(t, m.repo, "git", "rev-parse", "HEAD^"))
+			tree := strings.TrimSpace(run(t, m.repo, "git", "rev-parse", "HEAD^{tree}"))
 			detectors := strings.TrimSpace(run(t, m.repo, "git", "rev-parse", head+":internal/detect"))
 			if c.detectors != "" {
 				detectors = c.detectors
 			}
 			p, _, _ := m.r.Ship.Load(m.c.ID)
-			p.Repo, p.Landed = SelfRepo, []string{head}
+			p.Repo, p.Landed, p.Host, p.BaseCommit = SelfRepo, []string{head}, m.repo, base
 			if !c.counted {
 				p.Plan = &Plan{Signal: goodSignal, Window: 7 * 24 * time.Hour, At: m.planAt, Replay: true}
 				if c.noSignal {
@@ -444,7 +446,7 @@ func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
 			if c.own != nil {
 				sigs = c.own
 			}
-			p.Check = &Check{Replay: &SelfReplay{Diff: rekey.Diff{Before: 6, Dropped: []rekey.Count{{Signature: m.c.Signatures[0], N: 6}}},
+			p.Check = &Check{Tree: tree, Replay: &SelfReplay{Diff: rekey.Diff{Before: 6, Dropped: []rekey.Count{{Signature: m.c.Signatures[0], N: 6}}},
 				Own: sigs, OwnSeen: sigs, Paths: []string{"internal/detect/failures.go", "internal/detect/detect_test.go"}, Detectors: detectors}}
 			if c.legacy {
 				p.Check.Replay.Paths, p.Check.Replay.Detectors, p.Check.Replay.OwnSeen = nil, "", nil
@@ -456,11 +458,15 @@ func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
 			cs := m.theCase(t)
 			kept, _, _ := m.r.Ship.Load(m.c.ID)
 			switch c.want {
-			case "lapsed", "held":
-				// counted again at the landing, or, when no count stands there, measured by hand
-				if got.Status != "waiting" && got.Status != "held" || c.want == "held" && (got.Status != "held" || kept.Plan.Units != "") ||
-					kept.Plan.Replay || cs.Status != store.CaseDeployed {
+			case "lapsed":
+				// counted again at the landing, measured from the next pass
+				if got.Status != "waiting" || kept.Plan.Replay || kept.Plan.Units == "" || !kept.Plan.At.Equal(kept.LandedAt) || cs.Status != store.CaseDeployed {
 					t.Fatalf("a lapsed replay plan: measured %+v, plan %+v, case %s", got, kept.Plan, cs.Status)
+				}
+			case "held":
+				// no count stands at the landing: measured by hand
+				if got.Status != "held" || kept.Plan.Replay || kept.Plan.Units != "" || cs.Status != store.CaseDeployed {
+					t.Fatalf("a lapsed replay plan with no count: measured %+v, plan %+v, case %s", got, kept.Plan, cs.Status)
 				}
 			case "detector fix":
 				if got.Status != c.want || cs.Status != store.CaseClosed || cs.Reason != store.DetectorFix || !strings.Contains(cs.Measurement.Effect, "dropped: 6") {
