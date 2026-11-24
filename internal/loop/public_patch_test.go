@@ -45,3 +45,50 @@ func TestPublicPatchAdmitsStandardHomePaths(t *testing.T) {
 		}
 	}
 }
+
+// Names and addresses set aside for documentation and tests (RFC 2606, 6761, 5737, 3849) and loopback name no one: a
+// patch line with them passes the public check, while a real-shaped host or address, a home path or an email is still
+// refused there, and evidence still masks them all.
+func TestPublicPatchAdmitsReservedHostsAndAddresses(t *testing.T) {
+	ctx := context.Background()
+	// added lines of a detector test the check once refused
+	fixture := strings.Join([]string{
+		`		{"WebFetch", "connect ECONNREFUSED 192.0.2.10:443", ` + "`" + `{"url":"https://site-a.example/x","prompt":"p"}` + "`" + `, "host:webfetch:site-a.example"},`,
+		`		{"WebFetch", "connect ECONNREFUSED 192.0.2.10:443", ` + "`" + `{"url":"https://Site-A.example/other","prompt":"p"}` + "`" + `, "host:webfetch:site-a.example"},`,
+		`		{"WebFetch", "connect ECONNREFUSED 198.51.100.7:443", ` + "`" + `{"url":"https://site-b.example/","prompt":"p"}` + "`" + `, "host:webfetch:site-b.example"},`,
+		`		{"WebFetch", "connect ETIMEDOUT 203.0.113.5:443", ` + "`" + `{"url":"https://site-c.example/y"}` + "`" + `, "host:webfetch:site-c.example"},`,
+		`		{"WebFetch", "connect ECONNREFUSED 127.0.0.1:443", ` + "`" + `{"url":"https://site-d.example/"}` + "`" + `, "host:webfetch:site-d.example"},`,
+		`		{"WebFetch", "connect ECONNREFUSED 192.0.2.10:443", ` + "`" + `{"url":"https://site-a.exa` + "`" + `, ""},`,
+		`		{"mcp__web-tools__fetch", "connect ECONNREFUSED 127.0.0.1:8080", "", "mcp:web-tools:connect econnrefused N:N"},`,
+		`	a, okA := mistakeKey("tool-error", "WebFetch", "WebFetch: connect ECONNREFUSED 192.0.2.10:443",`,
+		`		mistakeCall(` + "`" + `{"input":{"url":"https://site-a.example/x","prompt":"p"}}` + "`" + `))`,
+		`		mistakeCall(` + "`" + `{"input":"{\"url\":\"https://site-b.example/x\"}"}` + "`" + `))`,
+		`	if !okA || !okB || a.String() != "host:webfetch:site-a.example" || b.String() != "host:webfetch:site-b.example" {`,
+	}, "\n")
+	lines := []string{
+		fixture,
+		"curl https://api.example.com/v1 and http://www.example.net/ and https://docs.example.org/x",
+		"ssh build-box.test; ping host.invalid; open http://app.localhost:3000/ and http://localhost.",
+		"dial [2001:db8::5]:443, [2001:DB8:1::7]:80, [::1]:8080 and 127.10.0.1",
+	}
+	for _, line := range lines {
+		if err := patchText(ctx, line, "added lines"); err != nil {
+			t.Errorf("a reserved name or address was refused: %q: %v", line, err)
+		}
+	}
+	for _, line := range []string{
+		"https://build-box-7.corp-name.com/x", "https://evil-example.com/x", "https://example.com.evil.net/x",
+		"https://site.example.co/x", "ssh build-box.local", "connect ECONNREFUSED 192.0.3.10:443",
+		"connect ECONNREFUSED 198.51.101.7:443", "dial [2001:db9::5]:443", "mail someone@site.example",
+		"read ~/projects/private/x next to https://site-a.example/x",
+	} {
+		if err := patchText(ctx, line, "added lines"); !errors.Is(err, ErrRefused) {
+			t.Errorf("personal content was not refused: %q: %v", line, err)
+		}
+	}
+	for _, line := range []string{"https://site-a.example/x", "connect 192.0.2.10:443"} {
+		if got := maskPersonal(line); !strings.Contains(got, "[personal]") {
+			t.Errorf("evidence kept a reserved name or address: %q", got)
+		}
+	}
+}

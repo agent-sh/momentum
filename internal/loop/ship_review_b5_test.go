@@ -22,8 +22,8 @@ func TestPublicPatchIsScannedBeforePublication(t *testing.T) {
 	}{
 		{"review-probe", "fake.go", "// seen at /home/alice/work/x on build-box-7.internal.example by alice@example.com\n", false, true},
 		{"home", "fake.go", "// /Users/alice/work\n", false, true},
-		{"ipv4", "fake.go", "// 192.0.2.7\n", false, true},
-		{"ipv6", "fake.go", "// 2001:db8::7\n", false, true},
+		{"ipv4", "fake.go", "// 198.18.0.7\n", false, true},
+		{"ipv6", "fake.go", "// 2001:db9::7\n", false, true},
 		{"secret", "fake.go", "// password=marker-7f3a\n", false, true},
 		{"filename", "alice@example.com.txt", "marker-7f3a\n", false, true},
 		{"private", "fake.go", "// /home/alice/work alice@example.com\n", true, false},

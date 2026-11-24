@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"net/netip"
 	"slices"
 	"strings"
 )
@@ -47,7 +48,7 @@ func (s *Ship) checkPublicPatch(ctx context.Context, p Package, candidate string
 }
 
 func patchText(ctx context.Context, text, part string) error {
-	if checked := withoutStandardHomes(text); maskPersonal(checked) != checked {
+	if checked := withoutReserved(withoutStandardHomes(text)); maskPersonal(checked) != checked {
 		return refused("patch %s contain personal content (a home path, address, IP or domain-shaped host; "+
 			"a test fixture names a path under its temporary directory, not the home)", part)
 	}
@@ -109,5 +110,76 @@ func withoutStandardHomes(text string) string {
 			return strings.TrimPrefix(match, "~/")
 		}
 		return match
+	})
+}
+
+// reservedDomains are the names RFC 2606 and RFC 6761 set aside for documentation and tests, and localhost: no one
+// owns one, so a patch that names one or a name below it says nothing of its owner. Only the public-patch check reads
+// this list; evidence masks these names as any other host (maskPersonal).
+var reservedDomains = []string{"example.com", "example.net", "example.org", "example", "test", "invalid", "localhost"}
+
+// reservedPrefixes are the address ranges RFC 5737 (IPv4) and RFC 3849 (IPv6) set aside for documentation. Loopback
+// addresses are admitted too (reservedAddress).
+var reservedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("2001:db8::/32"),
+}
+
+// reservedHost says whether a host (a hostNameRe match) is a reserved name or a name below one.
+func reservedHost(host string) bool {
+	host = strings.ToLower(host)
+	for _, domain := range reservedDomains {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
+// reservedAddress says whether an address is a documentation or a loopback address.
+func reservedAddress(address string) bool {
+	ip, err := netip.ParseAddr(address)
+	if err != nil {
+		return false
+	}
+	ip = ip.WithZone("").Unmap()
+	if ip.IsLoopback() {
+		return true
+	}
+	for _, prefix := range reservedPrefixes {
+		if prefix.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutReserved is text with each reserved address and host (reservedAddress, reservedHost) replaced by a word the
+// personal masks do not read, so every other address and host stays for them. An address at a reserved host is still
+// an address: its local part stays before the @.
+func withoutReserved(text string) string {
+	text = ipv4Re.ReplaceAllStringFunc(text, func(match string) string {
+		if reservedAddress(match) {
+			return "reserved"
+		}
+		return match
+	})
+	text = ipv6Re.ReplaceAllStringFunc(text, func(token string) string {
+		prefix, address := "", token
+		if label, rest, ok := strings.Cut(address, ":"); ok && label != "" && !hexLabel(label) {
+			prefix, address = label+":", rest
+		}
+		if ip, _, _ := strings.Cut(address, "%"); strings.Contains(ip, ":") && reservedAddress(ip) {
+			return prefix + "reserved"
+		}
+		return token
+	})
+	return hostNameRe.ReplaceAllStringFunc(text, func(host string) string {
+		if reservedHost(host) {
+			return "reserved"
+		}
+		return host
 	})
 }
