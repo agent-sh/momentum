@@ -554,8 +554,9 @@ func newUVLockIn(t *testing.T, cache string, procs func(cache, lock string) []fa
 	write(t, other, "")
 	var ost syscall.Stat_t
 	must(t, syscall.Stat(other, &ost))
-	fmt.Fprintf(&locks, "%d: FLOCK  ADVISORY  WRITE 555 %02x:%02x:%d 0 EOF\n", len(holders)+1, f.id.major, f.id.minor, ost.Ino)
-	fmt.Fprintf(&locks, "%d: -> FLOCK  ADVISORY  WRITE 99 %02x:%02x:%d 0 EOF\n", len(holders)+1, f.id.major, f.id.minor, ost.Ino)
+	omaj, omin := unix.Major(uint64(ost.Dev)), unix.Minor(uint64(ost.Dev))
+	fmt.Fprintf(&locks, "%d: FLOCK  ADVISORY  WRITE 555 %02x:%02x:%d 0 EOF\n", len(holders)+1, omaj, omin, ost.Ino)
+	fmt.Fprintf(&locks, "%d: -> FLOCK  ADVISORY  WRITE 99 %02x:%02x:%d 0 EOF\n", len(holders)+1, omaj, omin, ost.Ino)
 	write(t, filepath.Join(f.proc, "locks"), locks.String())
 	return f
 }

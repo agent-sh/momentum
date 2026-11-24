@@ -72,7 +72,8 @@ func TestAFixPlacedInPathsNowInReachIsInvestigatedAgain(t *testing.T) {
 		t.Fatalf("a second time in the episode: %s %q %v", picked.ID, why, err)
 	}
 
-	for _, p := range []string{place, "internal/detect/ in " + SelfRepo, "internal/detect/failures.go:120 (toolKey) in " + SelfRepo, "README.md and internal/supervise/rules.go in agent-sh/Momentum"} {
+	for _, p := range []string{place, "internal/detect/ in " + SelfRepo, "internal/detect/failures.go:120 (toolKey) in " + SelfRepo,
+		"internal/detect/failures.go and the internal key in " + SelfRepo, "README.md and internal/supervise/rules.go in agent-sh/Momentum"} {
 		if !ownPlaceInReach(p) {
 			t.Errorf("%q is in reach", p)
 		}
@@ -96,10 +97,13 @@ func TestAFixPlacedInPathsNowInReachIsInvestigatedAgain(t *testing.T) {
 		"internal/detect/x.go and https://github.com/" + SelfRepo + "/blob/main/internal/loop/gate.go", // a URL
 		"internal/detect/x.go, " + SelfRepo + ":internal/loop/gate.go",
 		"internal/detect/x.go and file:internal/loop/gate.go in " + SelfRepo,
-		"internal/detect/x.go and cmd in " + SelfRepo,                      // a bare protected directory
-		"internal/detect/x.go|internal/loop/gate.go in " + SelfRepo,        // two paths in one word
-		"internal/capacity/run in " + SelfRepo,                             // a protected file without its extension
-		"internal/detect/failures.go in " + SelfRepo + " and internal/ca…", // a place cut short
+		"internal/detect/x.go|internal/loop/gate.go in " + SelfRepo,                                  // two paths in one word
+		"internal/capacity/run in " + SelfRepo,                                                       // a protected file without its extension
+		"internal/detect/failures.go in " + SelfRepo + " and …",                                      // a place cut short
+		"internal/detect/failures.go in " + SelfRepo + " " + strings.Repeat("and the detector ", 10), // as long as the clip
+		"internal/./loop/gate.go in " + SelfRepo,                                                     // not clean
+		"internal/capacity/run.go/ in " + SelfRepo,
+		"internal/detect/x.go and cmd/ in " + SelfRepo,
 	} {
 		if ownPlaceInReach(p) {
 			t.Errorf("%q is out of reach", p)

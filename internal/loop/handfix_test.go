@@ -182,6 +182,12 @@ func TestAFileTheInvestigationNamesChangingIsAFixByHand(t *testing.T) {
 	}
 	hook := filepath.Join(r.Inputs.Home, "mods", "hook", "register.ts")
 	write(t, hook, "the hook, fixed")
+	// a file's time comes from the kernel's coarse clock, which can read a little before the time the case went to
+	// testing, taken just before: the change is dated by the fine clock, as a change made by hand later would be
+	now := time.Now()
+	if err := os.Chtimes(hook, now, now); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 2; i++ {
 		if err := r.seeHandFixes(ctx, cs); err != nil {
 			t.Fatal(err)

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -51,7 +52,7 @@ var pathWord = regexp.MustCompile(`^([A-Za-z0-9._/-]+?)(?::\d+(?:[:-]\d+)?|#L\d+
 // README.md), and none that no change may touch (proposalProtected), nor a directory that holds one. A path may have a
 // line after it (a colon and its number, a #L anchor). A place cut short (placeMax), a word with anything else in
 // it (a URL, a glob, a home, a pipe), an absolute path or a step up, a path under any other first part (which may be
-// another repository), another root file, and a bare name of what no change may touch (cmd, vendor, go.mod) are not.
+// another repository), another root file, a path that is not clean (a . or an empty part), and a protected root file or directory named bare (go.mod, cmd/) are not.
 func ownPlaceInReach(place string) bool {
 	if !strings.Contains(strings.ToLower(place), strings.ToLower(SelfRepo)) || strings.HasSuffix(place, "…") || utf8.RuneCountInString(place) >= placeMax {
 		return false
@@ -67,7 +68,7 @@ func ownPlaceInReach(place string) bool {
 		if w == "" || strings.EqualFold(w, SelfRepo) {
 			continue
 		}
-		if bare[strings.ToLower(strings.TrimSuffix(w, "/"))] {
+		if (strings.HasSuffix(w, "/") || strings.Contains(w, ".")) && bare[strings.ToLower(strings.TrimSuffix(w, "/"))] {
 			return false // a bare name of a directory or root file no change may touch, or one that holds such paths
 		}
 		if !strings.ContainsAny(w, "/:#*?~$\\|+&=@%") && !hasPathExt(w) {
@@ -77,7 +78,10 @@ func ownPlaceInReach(place string) bool {
 		if m == nil {
 			return false // a URL, a glob, a home, two paths in one word
 		}
-		w = m[1]
+		w = strings.TrimSuffix(m[1], "/")
+		if path.Clean(w) != w {
+			return false // a . or an empty part: not the path as the gate reads it
+		}
 		if strings.HasPrefix(w, "/") || strings.HasPrefix(w, ".") || strings.Contains(w, "..") || strings.Contains(w, "//") {
 			return false // outside the repository
 		}
