@@ -739,19 +739,20 @@ func writersOf(runs []fastRun) []Writer {
 	return out
 }
 
-// fillTitle says what the fill is: the growth of the disk's use, as statfs read it over the window, and when it
+// fillTitle says what the fill is: the rate the disk's use grows at, as statfs read it over the window, and when it
 // reaches the full percent at that rate, which is a line and not the disk's end: the room it has is said with it.
-// Past the line, it says when no room is left.
+// Past the line, it says when no room is left. When the time comes first, a clip at store.TitleMax keeps it.
 func fillTitle(d DiskState) string {
-	t := fmt.Sprintf("%s is growing %.0f GiB/h (+%s in %s); %.0f%% used, %s free", d.Disk, d.Rate, gib(d.grew), roundSpan(d.Window), d.pctFull, gib(d.Avail))
+	t := fmt.Sprintf("%s is growing %.0f GiB/h", d.Disk, d.Rate)
 	switch {
 	case d.FullIn <= 0:
+		t += ","
 	case d.line > 0:
-		t += fmt.Sprintf("; at this rate it reaches the %.0f%% line in %s", d.line, roundSpan(d.FullIn))
+		t += fmt.Sprintf(": at the %.0f%% line in %s,", d.line, roundSpan(d.FullIn))
 	default:
-		t += fmt.Sprintf("; at this rate no room is left in %s", roundSpan(d.FullIn))
+		t += fmt.Sprintf(": no room left in %s,", roundSpan(d.FullIn))
 	}
-	return t
+	return t + fmt.Sprintf(" %s free (+%s in %s)", gib(d.Avail), gib(d.grew), roundSpan(d.Window))
 }
 
 // roundSpan is a span to the minute, or to the second under one.

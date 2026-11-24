@@ -1065,7 +1065,13 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 				passed = append(passed, line)
 				continue
 			} else if repo == "" && target == "" {
-				if again, err := r.reachAgain(ctx, c, place, dry); err != nil {
+				// a case with no room for a run, or stopped, keeps its wait and its note: it would only wait again as investigating
+				stop, err := r.stopped(ctx, c, true)
+				if err != nil {
+					return nil, "", err
+				}
+				room := spent+r.Budgets.Run <= r.Budgets.Case && stop == ""
+				if again, err := r.reachAgain(ctx, c, place, room, dry); err != nil {
 					return nil, "", err
 				} else if again {
 					// its fix's place is in reach now: it is investigated at a later pass, ahead of the open cases

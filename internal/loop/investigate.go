@@ -369,7 +369,11 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 			FollowsEpisode int64  `json:"follows_episode,omitempty"`
 			FollowsSum     string `json:"follows_sum,omitempty"`
 			Episode        int64  `json:"episode"`
+			Reach          string `json:"reach,omitempty"`
 		}{Repo: f.Repo, Config: f.Config, Place: place, Episode: episode}
+		if place != "" { // the reach it was asked under, read again when the reach changes (reachAgain)
+			record.Reach = reachDigest()
+		}
 		if follows.ID != "" {
 			record.Follows, record.FollowsEpisode, record.FollowsSum = follows.ID, follows.Episode, causeSum(follows)
 		}

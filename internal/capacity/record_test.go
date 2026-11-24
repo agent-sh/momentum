@@ -1340,15 +1340,17 @@ func TestAFillsNoteSaysTheNetGrowthTheLineAndTheRoom(t *testing.T) {
 	o := options(t, proc, now, nil)
 	o.Rules = []string{RuleUV}
 	o.Writes = func() map[int]int64 { calls++; return map[int]int64{21: int64(calls) * 400 << 20} }
-	if _, err := Run(ctx, cfg, st, o); err != nil {
+	res, err := Run(ctx, cfg, st, o)
+	if err != nil {
 		t.Fatal(err)
 	}
 	n, ok, _ := st.Note(ctx, "capacity:fill:"+dir)
 	if !ok {
 		t.Fatal("no fill note")
 	}
-	line := fmt.Sprintf("reaches the %.0f%% line in ", cfg.Fill.Full)
-	for _, want := range []string{"d is growing 45 GiB/h (+15.0 GiB in 20m", "GiB free", line} {
+	line := fmt.Sprintf("d is growing 45 GiB/h: at the %.0f%% line in ", cfg.Fill.Full)
+	free := fmt.Sprintf(" %s free (+15.0 GiB in 20m0s)", gib(res.Disks[0].Avail))
+	for _, want := range []string{line, free} {
 		if !strings.Contains(n.Title, want) {
 			t.Errorf("the title does not say %q: %q", want, n.Title)
 		}
@@ -1358,5 +1360,12 @@ func TestAFillsNoteSaysTheNetGrowthTheLineAndTheRoom(t *testing.T) {
 	}
 	if !strings.Contains(n.Detail, "a rewrite counts") || !strings.Contains(n.Detail, "rewriter (pid 21)") {
 		t.Errorf("the detail names the writer as a likely one, whose count holds rewrites: %q", n.Detail)
+	}
+	// past the line the time is to no room left, and the title fits for a disk with a long path
+	past := fillTitle(DiskState{Disk: "/home/someone/ai-ml/data", Rate: 8, FullIn: 14*time.Hour + 31*time.Minute,
+		Avail: 116 << 30, grew: 3 << 30, Window: 25 * time.Minute})
+	if !strings.HasPrefix(past, "/home/someone/ai-ml/data is growing 8 GiB/h: no room left in 14h31m0s, 116.0 GiB free (+3.0 GiB in 25m0s)") ||
+		len([]rune(past)) > store.TitleMax {
+		t.Errorf("past the line: %q", past)
 	}
 }

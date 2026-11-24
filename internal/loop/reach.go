@@ -2,7 +2,10 @@ package loop
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -26,51 +29,64 @@ type reachRecord struct {
 }
 
 // selfTops are the first parts of the paths of the loop's own repository a place may name for a build to change.
-var selfTops = []string{"internal", "sessions", "cmd"}
+var selfTops = []string{"internal", "sessions"}
 
-// pathExts mark a word with no slash as a file: a root file of the repository.
-var pathExts = []string{".go", ".md", ".mod", ".sum", ".work", ".json", ".yml", ".yaml", ".toml", ".sh", ".ts", ".tsx", ".py"}
+// pathExts mark a word as a file, with no slash a root file of the repository.
+var pathExts = []string{".go", ".md", ".mod", ".sum", ".work", ".json", ".yml", ".yaml", ".toml", ".sh", ".ts", ".tsx", ".py", ".txt"}
+
+// reachDigest names the paths no build may change (ProposalProtected), as an investigation was told them: a record
+// made under the same list is not read again.
+func reachDigest() string {
+	sum := sha256.Sum256([]byte(strings.Join(ProposalProtected(), "\n")))
+	return hex.EncodeToString(sum[:8])
+}
 
 // ownPlaceInReach says whether a place an investigation named for a fix is in the loop's own repository and every
 // path it names there is one a build may change now: one at least, under the repository's own directories (or
-// README.md), and none that no change may touch (proposalProtected). A path outside the repository (a home or an
-// absolute path) or under any other first part (which may be another repository) is not.
+// README.md), and none that no change may touch (proposalProtected), nor a directory that holds one. A path is read
+// up to a line or symbol after it (a colon, a hash). A path outside the repository (a home or an absolute path), under
+// any other first part (which may be another repository), another root file, a glob or a step up is not.
 func ownPlaceInReach(place string) bool {
 	if !strings.Contains(strings.ToLower(place), strings.ToLower(SelfRepo)) {
 		return false
 	}
 	paths := 0
 	for _, w := range strings.FieldsFunc(place, func(r rune) bool { return unicode.IsSpace(r) || strings.ContainsRune("(),;`'\"[]{}<>", r) }) {
-		w = strings.TrimRight(w, ".,:;")
+		w, _, _ = strings.Cut(w, "#")
+		w, _, _ = strings.Cut(w, ":")
+		w = strings.TrimRight(w, ".,")
 		if w == "" || strings.EqualFold(w, SelfRepo) {
 			continue
 		}
+		last := w[strings.LastIndex(w, "/")+1:]
 		file := false
 		for _, ext := range pathExts {
-			file = file || strings.HasSuffix(strings.ToLower(w), ext)
+			file = file || strings.HasSuffix(strings.ToLower(last), ext)
 		}
 		if !strings.Contains(w, "/") && !file {
 			continue // a word, not a path
 		}
-		if strings.HasPrefix(w, "~") || strings.HasPrefix(w, "/") || strings.HasPrefix(w, "$") || strings.HasPrefix(w, ".") {
-			return false // a path outside the repository
+		if strings.ContainsAny(w, "*?~$\\") || strings.HasPrefix(w, "/") || strings.HasPrefix(w, ".") || strings.Contains(w, "..") {
+			return false // outside the repository, or more than one path
 		}
 		top, _, nested := strings.Cut(w, "/")
-		switch {
-		case !nested && w == "README.md":
-		case !nested:
-			return false // another root file: no change creates or edits one but README.md
-		default:
-			known := false
-			for _, t := range selfTops {
-				known = known || top == t
+		if !nested {
+			if w != "README.md" {
+				return false // another root file: no change edits one but README.md
 			}
-			if !known {
-				return false
-			}
+		} else if !slices.Contains(selfTops, top) {
+			return false
 		}
 		if proposalProtected(w) {
 			return false
+		}
+		if !file { // a directory: none of what it holds may be out of reach
+			dir := strings.TrimSuffix(w, "/") + "/"
+			for _, p := range ProposalProtected() {
+				if strings.HasPrefix(strings.ToLower(p), strings.ToLower(dir)) {
+					return false
+				}
+			}
 		}
 		paths++
 	}
@@ -78,31 +94,44 @@ func ownPlaceInReach(place string) bool {
 }
 
 // reachAgain sends back to be investigated a case in testing whose investigation named no repo and placed the fix in
-// the loop's own repository, in paths a build may change now (ownPlaceInReach), once in the case's episode. It reports
-// whether it did; a dry pass writes nothing.
-func (r *Runner) reachAgain(ctx context.Context, c store.Case, place string, dry bool) (bool, error) {
-	if !ownPlaceInReach(place) {
+// the loop's own repository, in paths a build may change now (ownPlaceInReach), when the investigation was told
+// another reach (reachDigest) and the case has room to run (not out of budget, not stopped): once in the case's
+// episode. It reports whether it did; a dry pass writes nothing.
+func (r *Runner) reachAgain(ctx context.Context, c store.Case, place string, room, dry bool) (bool, error) {
+	if !room || !ownPlaceInReach(place) {
 		return false, nil
 	}
 	log, err := r.Store.CaseLog(ctx, c.ID)
 	if err != nil {
 		return false, err
 	}
+	for i := len(log) - 1; i >= 0; i-- { // the record the place came from
+		if log[i].Action != repoAction {
+			continue
+		}
+		var rec struct {
+			Reach string `json:"reach"`
+		}
+		if json.Unmarshal([]byte(log[i].Detail), &rec) == nil && rec.Reach == reachDigest() {
+			return false, nil // its investigation was told today's reach
+		}
+		break
+	}
 	for _, e := range log {
 		var rec reachRecord
 		if e.Action == reachAgainAction && json.Unmarshal([]byte(e.Detail), &rec) == nil && rec.Episode == c.Episode {
-			return false, nil // its investigation read today's reach already, and named no repo
+			return false, nil // it went back once this episode already
 		}
 	}
 	if dry {
 		return true, nil
 	}
-	raw, _ := json.Marshal(reachRecord{Place: place, Episode: c.Episode})
-	// the case moves first: a hold lifted over a case that then stayed would show a wait with no reason
-	if err := r.Store.CaseNote(cleanedNote(ctx), c.ID, reachAgainAction, string(raw), "loop"); err != nil {
+	// the case moves first: its line is what keeps it from going back twice, so a move that failed leaves none
+	if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "loop"); err != nil {
 		return false, err
 	}
-	if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "loop"); err != nil {
+	raw, _ := json.Marshal(reachRecord{Place: place, Episode: c.Episode})
+	if err := r.Store.CaseNote(cleanedNote(ctx), c.ID, reachAgainAction, string(raw), "loop"); err != nil {
 		return false, err
 	}
 	r.keepHold(ctx, c, "", false)

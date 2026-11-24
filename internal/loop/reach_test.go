@@ -28,6 +28,18 @@ func TestAFixPlacedInPathsNowInReachIsInvestigatedAgain(t *testing.T) {
 		}
 	}
 	record()
+	// an investigation told today's reach that named no repo waits
+	if _, _, why, err := r.pick(ctx, c.Family, c.ID, true); err != nil || strings.Contains(why, "goes back to be investigated") {
+		t.Fatalf("a record under today's reach goes back: %q %v", why, err)
+	}
+	// the record of an investigation told another reach (an older list, or none recorded)
+	older := func() {
+		t.Helper()
+		if err := st.CaseNote(ctx, c.ID, repoAction, `{"repo":"","place":"`+place+`","episode":1,"reach":"older"}`, "loop:r"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	older()
 	if _, _, why, err := r.pick(ctx, c.Family, c.ID, true); err != nil || !strings.Contains(why, "goes back to be investigated") {
 		t.Fatalf("a dry pass says the case goes back: %q %v", why, err)
 	}
@@ -46,13 +58,14 @@ func TestAFixPlacedInPathsNowInReachIsInvestigatedAgain(t *testing.T) {
 	if picked, step, _, err := r.pick(ctx, c.Family, c.ID, true); err != nil || picked.ID != c.ID || step != StepInvestigate {
 		t.Fatalf("the next pass investigates it: %s %s %v", picked.ID, step, err)
 	}
-	// the new investigation still names the place and no repo: once an episode, the case waits
+	// the new investigation still names the place and no repo, under another reach again: once an episode, the case waits
 	record()
+	older()
 	if picked, _, why, err := r.pick(ctx, c.Family, c.ID, false); err != nil || picked.ID != "" || !strings.Contains(why, "out of the loop's reach") {
 		t.Fatalf("a second time in the episode: %s %q %v", picked.ID, why, err)
 	}
 
-	for _, p := range []string{place, "internal/detect/ in " + SelfRepo, "README.md and internal/supervise/rules.go in agent-sh/Momentum"} {
+	for _, p := range []string{place, "internal/detect/ in " + SelfRepo, "internal/detect/failures.go:120 (toolKey) in " + SelfRepo, "README.md and internal/supervise/rules.go in agent-sh/Momentum"} {
 		if !ownPlaceInReach(p) {
 			t.Errorf("%q is in reach", p)
 		}
@@ -64,8 +77,15 @@ func TestAFixPlacedInPathsNowInReachIsInvestigatedAgain(t *testing.T) {
 		"internal/detect/failures.go in " + SelfRepo + " and ~/.claude/mods/x.ts",
 		"agent-sh/tacit internal/x.go, with " + SelfRepo, // another repository
 		"go.mod in " + SelfRepo,
-		"the detectors of " + SelfRepo, // no path
-		"internal/detect/failures.go",  // no repository named
+		"the detectors of " + SelfRepo,                // no path
+		"internal/detect/failures.go",                 // no repository named
+		"internal/capacity/run.go:120 in " + SelfRepo, // a protected file with a line after it
+		"internal/capacity/record.go#L5 in " + SelfRepo,
+		"internal/capacity in " + SelfRepo,      // a directory that holds protected files
+		"internal/ in " + SelfRepo,              // the same
+		"internal/capacity/*.go in " + SelfRepo, // a glob
+		"internal/detect/../loop/gate.go in " + SelfRepo,
+		"internal/detect/x.go and go.mod:3 in " + SelfRepo,
 	} {
 		if ownPlaceInReach(p) {
 			t.Errorf("%q is out of reach", p)
