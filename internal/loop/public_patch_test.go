@@ -70,6 +70,7 @@ func TestPublicPatchAdmitsReservedHostsAndAddresses(t *testing.T) {
 		"curl https://api.example.com/v1 and http://www.example.net/ and https://docs.example.org/x",
 		"ssh build-box.test; ping host.invalid; open http://app.localhost:3000/ and http://localhost.",
 		"dial [2001:db8::5]:443, [2001:DB8:1::7]:80, [::1]:8080 and 127.10.0.1",
+		"dial 2001:db8::192.0.2.1 or ::ffff:192.0.2.1; resolve EXAMPLE.COM and a.b.test.",
 	}
 	for _, line := range lines {
 		if err := patchText(ctx, line, "added lines"); err != nil {
@@ -80,7 +81,11 @@ func TestPublicPatchAdmitsReservedHostsAndAddresses(t *testing.T) {
 		"https://build-box-7.corp-name.com/x", "https://evil-example.com/x", "https://example.com.evil.net/x",
 		"https://site.example.co/x", "ssh build-box.local", "connect ECONNREFUSED 192.0.3.10:443",
 		"connect ECONNREFUSED 198.51.101.7:443", "dial [2001:db9::5]:443", "mail someone@site.example",
-		"read ~/projects/private/x next to https://site-a.example/x",
+		"read ~/projects/private/x next to https://site-a.example/x", "/root.test/x", "mail someone@192.0.2.1",
+		// a reserved name or address next to a real one
+		"dial 2001:db9::192.0.2.1", "dial 2001:db8::198.18.4.5", "dial ::1.18.4.5", "ssh a.corp.internal.192.0.2.1",
+		"ssh 192.0.2.1.corp.com",
+		"https://corp-name.site.example-corp.com/x",
 	} {
 		if err := patchText(ctx, line, "added lines"); !errors.Is(err, ErrRefused) {
 			t.Errorf("personal content was not refused: %q: %v", line, err)

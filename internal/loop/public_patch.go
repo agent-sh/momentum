@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"net/netip"
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -48,7 +49,11 @@ func (s *Ship) checkPublicPatch(ctx context.Context, p Package, candidate string
 }
 
 func patchText(ctx context.Context, text, part string) error {
-	if checked := withoutReserved(withoutStandardHomes(text)); maskPersonal(checked) != checked {
+	// Home paths and addresses are refused whatever host they name; the rest is checked with the reserved names and
+	// addresses taken out.
+	checked := withoutStandardHomes(text)
+	public := withoutReserved(checked)
+	if homePathRe.MatchString(checked) || addressRe.MatchString(checked) || maskPersonal(public) != public {
 		return refused("patch %s contain personal content (a home path, address, IP or domain-shaped host; "+
 			"a test fixture names a path under its temporary directory, not the home)", part)
 	}
@@ -156,30 +161,57 @@ func reservedAddress(address string) bool {
 	return false
 }
 
-// withoutReserved is text with each reserved address and host (reservedAddress, reservedHost) replaced by a word the
-// personal masks do not read, so every other address and host stays for them. An address at a reserved host is still
-// an address: its local part stays before the @.
+// ipv6DottedRe is ipv6Re with a dotted tail, so a token that runs on into an IPv4 address is read whole.
+var ipv6DottedRe = regexp.MustCompile(`(?i)[a-z0-9_]*:[a-z0-9_:]+(?:\.[a-z0-9_]+)*(?:%[a-z0-9_-]+)?`)
+
+// withoutReserved is text with each reserved address and host (reservedAddress, reservedHost) that stands alone
+// blanked to a space, so every other address and host stays whole for the personal masks: a blank joins nothing to
+// its neighbours. IPv4 addresses go first, so an IPv6 address written with a reserved IPv4 tail is checked by its
+// head; a token that still has a dotted tail after that is left to the masks.
 func withoutReserved(text string) string {
-	text = ipv4Re.ReplaceAllStringFunc(text, func(match string) string {
-		if reservedAddress(match) {
-			return "reserved"
-		}
-		return match
+	text = blankReserved(text, ipv4Re, func(match string) (int, bool) {
+		return 0, reservedAddress(match)
 	})
-	text = ipv6Re.ReplaceAllStringFunc(text, func(token string) string {
-		prefix, address := "", token
+	text = blankReserved(text, ipv6DottedRe, func(token string) (int, bool) {
+		keep, address := 0, token
 		if label, rest, ok := strings.Cut(address, ":"); ok && label != "" && !hexLabel(label) {
-			prefix, address = label+":", rest
+			keep, address = len(label)+1, rest
 		}
-		if ip, _, _ := strings.Cut(address, "%"); strings.Contains(ip, ":") && reservedAddress(ip) {
-			return prefix + "reserved"
-		}
-		return token
+		ip, _, _ := strings.Cut(address, "%")
+		return keep, !strings.Contains(ip, ".") && strings.Contains(ip, ":") && reservedAddress(ip)
 	})
-	return hostNameRe.ReplaceAllStringFunc(text, func(host string) string {
-		if reservedHost(host) {
-			return "reserved"
-		}
-		return host
+	return blankReserved(text, hostNameRe, func(host string) (int, bool) {
+		return 0, reservedHost(host)
 	})
+}
+
+// blankReserved is text with each match of re that reserved admits, from the byte reserved says to keep onwards,
+// blanked to a space when it stands alone: not a label or a part of a longer dotted name or identifier.
+func blankReserved(text string, re *regexp.Regexp, reserved func(match string) (keep int, ok bool)) string {
+	var out strings.Builder
+	end := 0
+	for _, span := range re.FindAllStringIndex(text, -1) {
+		keep, ok := reserved(text[span[0]:span[1]])
+		start := span[0] + keep
+		if !ok || !standsAlone(text, start, span[1]) {
+			continue
+		}
+		out.WriteString(text[end:start])
+		out.WriteByte(' ')
+		end = span[1]
+	}
+	out.WriteString(text[end:])
+	return out.String()
+}
+
+// standsAlone says whether text[start:end] is joined to no name around it: no dot, dash or underscore before it,
+// and no dash, underscore or dotted label after it.
+func standsAlone(text string, start, end int) bool {
+	if start > 0 && strings.IndexByte(".-_", text[start-1]) >= 0 {
+		return false
+	}
+	if end < len(text) && strings.IndexByte("-_", text[end]) >= 0 {
+		return false
+	}
+	return end+1 >= len(text) || text[end] != '.' || !identifierByte(text[end+1])
 }
