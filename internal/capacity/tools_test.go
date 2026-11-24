@@ -548,9 +548,14 @@ func newUVLockIn(t *testing.T, cache string, procs func(cache, lock string) []fa
 	for i, pid := range holders {
 		fmt.Fprintf(&locks, "%d: FLOCK  ADVISORY  READ %d %02x:%02x:%d 0 EOF\n", i+1, pid, f.id.major, f.id.minor, f.id.ino)
 	}
-	// a lock on another file, and a process waiting for it, are another file's
-	fmt.Fprintf(&locks, "%d: FLOCK  ADVISORY  WRITE 555 %02x:%02x:%d 0 EOF\n", len(holders)+1, f.id.major, f.id.minor, f.id.ino+1)
-	fmt.Fprintf(&locks, "%d: -> FLOCK  ADVISORY  WRITE 99 %02x:%02x:%d 0 EOF\n", len(holders)+1, f.id.major, f.id.minor, f.id.ino+1)
+	// a lock on another file, and a process waiting for it, are another file's: a file that stays, so no file a test
+	// makes later (a lock file replaced before) takes its inode
+	other := filepath.Join(t.TempDir(), "other.lock")
+	write(t, other, "")
+	var ost syscall.Stat_t
+	must(t, syscall.Stat(other, &ost))
+	fmt.Fprintf(&locks, "%d: FLOCK  ADVISORY  WRITE 555 %02x:%02x:%d 0 EOF\n", len(holders)+1, f.id.major, f.id.minor, ost.Ino)
+	fmt.Fprintf(&locks, "%d: -> FLOCK  ADVISORY  WRITE 99 %02x:%02x:%d 0 EOF\n", len(holders)+1, f.id.major, f.id.minor, ost.Ino)
 	write(t, filepath.Join(f.proc, "locks"), locks.String())
 	return f
 }

@@ -1349,7 +1349,7 @@ func TestAFillsNoteSaysTheNetGrowthTheLineAndTheRoom(t *testing.T) {
 		t.Fatal("no fill note")
 	}
 	line := fmt.Sprintf("d is growing 45 GiB/h: at the %.0f%% line in ", cfg.Fill.Full)
-	free := fmt.Sprintf(" %s free (+15.0 GiB in 20m0s)", gib(res.Disks[0].Avail))
+	free := fmt.Sprintf(" %s free (+%s in 20m0s)", gib(res.Disks[0].Avail), gib(res.Disks[0].grew)) // statfs is read live
 	for _, want := range []string{line, free} {
 		if !strings.Contains(n.Title, want) {
 			t.Errorf("the title does not say %q: %q", want, n.Title)

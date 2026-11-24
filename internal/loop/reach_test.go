@@ -40,6 +40,13 @@ func TestAFixPlacedInPathsNowInReachIsInvestigatedAgain(t *testing.T) {
 		}
 	}
 	older()
+	// a case with no room for a run keeps its wait: it would only wait again as investigating
+	full := r.Budgets.Case
+	r.Budgets.Case = 0
+	if picked, _, why, err := r.pick(ctx, c.Family, c.ID, false); err != nil || picked.ID != "" || !strings.Contains(why, "out of the loop's reach") {
+		t.Fatalf("a case with no room goes back: %s %q %v", picked.ID, why, err)
+	}
+	r.Budgets.Case = full
 	if _, _, why, err := r.pick(ctx, c.Family, c.ID, true); err != nil || !strings.Contains(why, "goes back to be investigated") {
 		t.Fatalf("a dry pass says the case goes back: %q %v", why, err)
 	}
@@ -86,6 +93,13 @@ func TestAFixPlacedInPathsNowInReachIsInvestigatedAgain(t *testing.T) {
 		"internal/capacity/*.go in " + SelfRepo, // a glob
 		"internal/detect/../loop/gate.go in " + SelfRepo,
 		"internal/detect/x.go and go.mod:3 in " + SelfRepo,
+		"internal/detect/x.go and https://github.com/" + SelfRepo + "/blob/main/internal/loop/gate.go", // a URL
+		"internal/detect/x.go, " + SelfRepo + ":internal/loop/gate.go",
+		"internal/detect/x.go and file:internal/loop/gate.go in " + SelfRepo,
+		"internal/detect/x.go and cmd in " + SelfRepo,                      // a bare protected directory
+		"internal/detect/x.go|internal/loop/gate.go in " + SelfRepo,        // two paths in one word
+		"internal/capacity/run in " + SelfRepo,                             // a protected file without its extension
+		"internal/detect/failures.go in " + SelfRepo + " and internal/ca…", // a place cut short
 	} {
 		if ownPlaceInReach(p) {
 			t.Errorf("%q is out of reach", p)

@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"regexp"
 	"slices"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -41,33 +43,43 @@ func reachDigest() string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// pathWord is a path as a place may name it: plain path characters, and a line or a line range after it.
+var pathWord = regexp.MustCompile(`^([A-Za-z0-9._/-]+?)(?::\d+(?:[:-]\d+)?|#L\d+(?:-L?\d+)?)?$`)
+
 // ownPlaceInReach says whether a place an investigation named for a fix is in the loop's own repository and every
 // path it names there is one a build may change now: one at least, under the repository's own directories (or
-// README.md), and none that no change may touch (proposalProtected), nor a directory that holds one. A path is read
-// up to a line or symbol after it (a colon, a hash). A path outside the repository (a home or an absolute path), under
-// any other first part (which may be another repository), another root file, a glob or a step up is not.
+// README.md), and none that no change may touch (proposalProtected), nor a directory that holds one. A path may have a
+// line after it (a colon and its number, a #L anchor). A place cut short (placeMax), a word with anything else in
+// it (a URL, a glob, a home, a pipe), an absolute path or a step up, a path under any other first part (which may be
+// another repository), another root file, and a bare name of what no change may touch (cmd, vendor, go.mod) are not.
 func ownPlaceInReach(place string) bool {
-	if !strings.Contains(strings.ToLower(place), strings.ToLower(SelfRepo)) {
+	if !strings.Contains(strings.ToLower(place), strings.ToLower(SelfRepo)) || strings.HasSuffix(place, "…") || utf8.RuneCountInString(place) >= placeMax {
 		return false
+	}
+	bare := map[string]bool{}
+	for _, p := range ProposalProtected() {
+		top, _, _ := strings.Cut(strings.ToLower(p), "/")
+		bare[top] = true
 	}
 	paths := 0
 	for _, w := range strings.FieldsFunc(place, func(r rune) bool { return unicode.IsSpace(r) || strings.ContainsRune("(),;`'\"[]{}<>", r) }) {
-		w, _, _ = strings.Cut(w, "#")
-		w, _, _ = strings.Cut(w, ":")
-		w = strings.TrimRight(w, ".,")
+		w = strings.TrimRight(w, ".,:")
 		if w == "" || strings.EqualFold(w, SelfRepo) {
 			continue
 		}
-		last := w[strings.LastIndex(w, "/")+1:]
-		file := false
-		for _, ext := range pathExts {
-			file = file || strings.HasSuffix(strings.ToLower(last), ext)
+		if bare[strings.ToLower(strings.TrimSuffix(w, "/"))] {
+			return false // a bare name of a directory or root file no change may touch, or one that holds such paths
 		}
-		if !strings.Contains(w, "/") && !file {
+		if !strings.ContainsAny(w, "/:#*?~$\\|+&=@%") && !hasPathExt(w) {
 			continue // a word, not a path
 		}
-		if strings.ContainsAny(w, "*?~$\\") || strings.HasPrefix(w, "/") || strings.HasPrefix(w, ".") || strings.Contains(w, "..") {
-			return false // outside the repository, or more than one path
+		m := pathWord.FindStringSubmatch(w)
+		if m == nil {
+			return false // a URL, a glob, a home, two paths in one word
+		}
+		w = m[1]
+		if strings.HasPrefix(w, "/") || strings.HasPrefix(w, ".") || strings.Contains(w, "..") || strings.Contains(w, "//") {
+			return false // outside the repository
 		}
 		top, _, nested := strings.Cut(w, "/")
 		if !nested {
@@ -77,10 +89,10 @@ func ownPlaceInReach(place string) bool {
 		} else if !slices.Contains(selfTops, top) {
 			return false
 		}
-		if proposalProtected(w) {
+		if proposalProtected(w) || proposalProtected(w+".go") {
 			return false
 		}
-		if !file { // a directory: none of what it holds may be out of reach
+		if !hasPathExt(w) { // a directory: none of what it holds may be out of reach
 			dir := strings.TrimSuffix(w, "/") + "/"
 			for _, p := range ProposalProtected() {
 				if strings.HasPrefix(strings.ToLower(p), strings.ToLower(dir)) {
@@ -91,6 +103,17 @@ func ownPlaceInReach(place string) bool {
 		paths++
 	}
 	return paths > 0
+}
+
+// hasPathExt says whether a word's last part ends as a file's name does.
+func hasPathExt(w string) bool {
+	last := strings.ToLower(w[strings.LastIndex(w, "/")+1:])
+	for _, ext := range pathExts {
+		if strings.HasSuffix(last, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 // reachAgain sends back to be investigated a case in testing whose investigation named no repo and placed the fix in
@@ -134,6 +157,12 @@ func (r *Runner) reachAgain(ctx context.Context, c store.Case, place string, roo
 	if err := r.Store.CaseNote(cleanedNote(ctx), c.ID, reachAgainAction, string(raw), "loop"); err != nil {
 		return false, err
 	}
-	r.keepHold(ctx, c, "", false)
+	// the hold ends with a line that says why, and its notes with it: the case waits for nothing now
+	if err := r.doneHoldNotes(ctx, c.ID); err != nil {
+		return false, err
+	}
+	if err := r.Store.CaseNote(cleanedNote(ctx), c.ID, store.ActionUnheld, "its fix's place is in the loop's reach now: it is investigated again", "loop"); err != nil {
+		return false, err
+	}
 	return true, nil
 }
