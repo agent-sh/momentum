@@ -67,6 +67,12 @@ func measuredCase(t *testing.T) *measured {
 
 func measuredCaseWithRead(t *testing.T, read bool) *measured {
 	t.Helper()
+	return measuredCaseBy(t, read, "test")
+}
+
+// measuredCaseBy is measuredCaseWithRead, its case opened by the actor.
+func measuredCaseBy(t *testing.T, read bool, actor string) *measured {
+	t.Helper()
 	ctx := context.Background()
 	st, db := testStoreAt(t)
 	seedHistory(t, st)
@@ -90,7 +96,7 @@ func measuredCaseWithRead(t *testing.T, read bool) *measured {
 	for _, e := range before[:6] {
 		f.Evidence = append(f.Evidence, store.Evidence{Ref: "ev:" + e.ID()})
 	}
-	c, _, err := st.ObserveCase(ctx, f, "test")
+	c, _, err := st.ObserveCase(ctx, f, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,17 +390,33 @@ func TestAPlanWithoutItsTimeOrUnitsMeasuresNothing(t *testing.T) {
 // keyed for, is held for a person, and a counted plan is measured as counted whatever its check's replay did.
 func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
 	for name, c := range map[string]struct {
-		own     []string
-		counted bool
-		want    string
+		own      []string
+		counted  bool
+		root     bool
+		evidence bool
+		want     string
 	}{
-		"its replay plan":                       {nil, false, "detector fix"},
-		"a replay keyed for other signatures":   {[]string{"failures/v1:another"}, false, "held"},
-		"a counted plan with a covering replay": {nil, true, "measuring"},
+		"its replay plan":                         {nil, false, false, false, "detector fix"},
+		"its replay plan, with a root cause":      {nil, false, true, false, "detector fix"},
+		"a replay keyed for other signatures":     {[]string{"failures/v1:another"}, false, false, false, "held"},
+		"evidence a person filed after the check": {nil, false, false, true, "held"},
+		"a counted plan with a covering replay":   {nil, true, false, false, "measuring"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			m := measuredCase(t)
+			ctx := context.Background()
+			m := measuredCaseBy(t, true, DetectorActor)
+			if c.root {
+				if _, _, err := m.st.AddCaseSignature(ctx, m.c.ID, store.RootPrefix+"the detector masks the address", "test"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if c.evidence {
+				if err := m.st.CaseNote(ctx, m.c.ID, "evidence", "1 filed by hand", "owner"); err != nil {
+					t.Fatal(err)
+				}
+			}
 			p, _, _ := m.r.Ship.Load(m.c.ID)
+			p.Repo = SelfRepo
 			if !c.counted {
 				p.Plan = &Plan{Signal: goodSignal, Window: 7 * 24 * time.Hour, At: m.planAt, Replay: true}
 			}

@@ -397,17 +397,20 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 			r.resolve(ctx, &p)
 		}
 	}
-	if c.Status == store.CaseDeployed && plan.Replay && p.Check != nil && p.Check.Replay != nil &&
-		detectorConfined(p.Check.Replay.Paths) && replayCovers(p.Check.Replay, c.Signatures) {
-		// only the plan its replay judged (replayPlan), while the replay still covers the case's signatures: a counted
-		// plan is measured as counted
-		rekeyed, dropped := p.Check.Replay.Diff.Touches(c.Signatures)
-		return r.detectorFixed(ctx, c, &p, m, rekeyed, dropped, dry)
-	}
 	if plan.Replay {
-		// the case's signatures changed since its proposal, and its replay no longer covers them: there is no count to
-		// fall back on, so a person decides
-		return r.byHand(ctx, c, "its plan is its check's detector replay, which no longer covers the case's signatures: it must be measured by hand", dry)
+		// only the plan its replay judged (replayPlan) closes on it, while the replay still judges the case as it is now:
+		// a counted plan is measured as counted. There is no count to fall back on, so anything else is a person's.
+		judged, err := r.Ship.replayJudges(ctx, c, p)
+		switch {
+		case err != nil:
+			return failed(err.Error())
+		case !judged:
+			return r.byHand(ctx, c, "its plan is its check's detector replay, which no longer judges the case (its signatures, or evidence not the detectors', came after the check): it must be measured by hand", dry)
+		case c.Status != store.CaseDeployed:
+			return r.byHand(ctx, c, "its plan is its check's detector replay, and the case is "+string(c.Status)+", not deployed: it must be measured by hand", dry)
+		}
+		rekeyed, dropped := p.Check.Replay.Diff.Touches(symptoms(c.Signatures))
+		return r.detectorFixed(ctx, c, &p, m, rekeyed, dropped, dry)
 	}
 	if c.Status == store.CaseDeployed || plan.Guard == nil && !p.OutOfEffect.IsZero() {
 		m.Status, m.Due = "measuring", since.Add(plan.Window)

@@ -247,6 +247,7 @@ func TestAReplayCoversOnlyAProblemItMovedWhole(t *testing.T) {
 		"keyed anew under its own":    {SelfReplay{Diff: rekey.Diff{Dropped: dropped.Dropped, Added: []rekey.Count{{Signature: a, N: 1}}}, Own: []string{a}, OwnSeen: []string{a}}, []string{a}, false},
 		"a signature not in its keys": {SelfReplay{Diff: dropped, Own: []string{a, b}, OwnSeen: []string{a}}, []string{a, b}, false},
 		"a signature taken after it":  {SelfReplay{Diff: dropped, Own: []string{a}, OwnSeen: []string{a}}, []string{a, b}, false},
+		"a root cause beside it":      {SelfReplay{Diff: dropped, Own: []string{a}, OwnSeen: []string{a}}, []string{a, store.RootPrefix + "cause"}, true},
 	} {
 		if got := replayCovers(&c.r, c.sigs); got != c.want {
 			t.Errorf("%s: covers %v, want %v", name, got, c.want)

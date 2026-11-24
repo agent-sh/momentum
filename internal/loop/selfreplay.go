@@ -99,6 +99,7 @@ func detectorConfined(changed []string) bool {
 // keyed events of in its window; it kept none of their events keyed as the base keys them, moved none of them to
 // another of the case's own, and keyed no event newly under any of them.
 func replayCovers(r *SelfReplay, sigs []string) bool {
+	sigs = symptoms(sigs)
 	if r == nil || len(sigs) == 0 || r.OwnKept > 0 {
 		return false
 	}
@@ -123,6 +124,12 @@ func replayCovers(r *SelfReplay, sigs []string) bool {
 	}
 	rekeyed, dropped := r.Diff.Touches(sigs)
 	return rekeyed+dropped > 0
+}
+
+// symptoms are a case's signatures a detector keys: all but its root causes' (store.RootPrefix), which a build adds
+// and no detector keys, so no replay moves them.
+func symptoms(sigs []string) []string {
+	return slices.DeleteFunc(slices.Clone(sigs), func(sig string) bool { return strings.HasPrefix(sig, store.RootPrefix) })
 }
 
 // replayDst is where a replay reads the store's copy in its sandbox.
