@@ -381,33 +381,41 @@ func TestAPlanWithoutItsTimeOrUnitsMeasuresNothing(t *testing.T) {
 
 // A detector fix's plan is its replay (replayPlan): it counts no signal, and once its change is in effect the case
 // closes as a detector fix, never as improved. A case that took a signature after the check, which the replay never
-// keyed for, is held for a person.
+// keyed for, is held for a person, and a counted plan is measured as counted whatever its check's replay did.
 func TestADetectorFixsReplayPlanClosesAsADetectorFix(t *testing.T) {
-	for _, own := range [][]string{nil, {"failures/v1:another"}} {
-		m := measuredCase(t)
-		p, _, _ := m.r.Ship.Load(m.c.ID)
-		p.Changed = []string{"internal/detect/failures.go", "internal/detect/detect_test.go"}
-		p.Plan = &Plan{Signal: goodSignal, Window: 7 * 24 * time.Hour, At: m.planAt, Replay: true}
-		sigs := m.c.Signatures
-		if own != nil {
-			sigs = own
-		}
-		p.Check = &Check{Replay: &SelfReplay{Diff: rekey.Diff{Before: 6, Dropped: []rekey.Count{{Signature: m.c.Signatures[0], N: 6}}},
-			Own: sigs}}
-		if err := m.r.Ship.save(&p); err != nil {
-			t.Fatal(err)
-		}
-		got := m.measure(t, Options{})
-		c := m.theCase(t)
-		if own != nil {
-			if got.Status != "held" || c.Status != store.CaseDeployed {
-				t.Fatalf("a replay keyed for other signatures: %+v, case %s", got, c.Status)
+	for name, c := range map[string]struct {
+		own     []string
+		counted bool
+		want    string
+	}{
+		"its replay plan":                       {nil, false, "detector fix"},
+		"a replay keyed for other signatures":   {[]string{"failures/v1:another"}, false, "held"},
+		"a counted plan with a covering replay": {nil, true, "measuring"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := measuredCase(t)
+			p, _, _ := m.r.Ship.Load(m.c.ID)
+			if !c.counted {
+				p.Plan = &Plan{Signal: goodSignal, Window: 7 * 24 * time.Hour, At: m.planAt, Replay: true}
 			}
-			continue
-		}
-		if got.Status != "detector fix" || c.Status != store.CaseClosed || c.Reason != store.DetectorFix || !strings.Contains(c.Measurement.Effect, "dropped: 6") {
-			t.Fatalf("a detector fix's replay plan: %+v, case %+v", got, c)
-		}
+			sigs := m.c.Signatures
+			if c.own != nil {
+				sigs = c.own
+			}
+			p.Check = &Check{Replay: &SelfReplay{Diff: rekey.Diff{Before: 6, Dropped: []rekey.Count{{Signature: m.c.Signatures[0], N: 6}}},
+				Own: sigs, OwnSeen: sigs, Paths: []string{"internal/detect/failures.go", "internal/detect/detect_test.go"}}}
+			if err := m.r.Ship.save(&p); err != nil {
+				t.Fatal(err)
+			}
+			got := m.measure(t, Options{Dry: c.counted})
+			cs := m.theCase(t)
+			if got.Status != c.want || (c.want == "detector fix") != (cs.Status == store.CaseClosed && cs.Reason == store.DetectorFix) {
+				t.Fatalf("measured %+v, case %s %s", got, cs.Status, cs.Reason)
+			}
+			if c.want == "detector fix" && !strings.Contains(cs.Measurement.Effect, "dropped: 6") {
+				t.Fatalf("its close: %+v", cs.Measurement)
+			}
+		})
 	}
 }
 

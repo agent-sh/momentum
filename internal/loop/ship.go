@@ -1002,7 +1002,7 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 		return p, refused("a proposal needs its rollback: how the change is undone")
 	}
 	var plan Plan
-	replay, err := s.replayPlan(ctx, c, p, paths, pr, s.now())
+	replay, err := s.replayPlan(ctx, c, p, pr, s.now())
 	if err != nil {
 		return p, err
 	}

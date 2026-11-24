@@ -1026,7 +1026,7 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 			} else if ok && (p.State == Proposed || p.State == Landing) {
 				r.placeHeld(ctx, c, p, dry, &passed)
 				continue // its review or its landing comes next (reviews)
-			} else if ok && p.State != Withdrawn && !p.ProposalAt.IsZero() && p.Plan != nil && !replayJudged(c, p, p.Changed) {
+			} else if judged, _ := r.Ship.replayJudges(ctx, c, p); ok && p.State != Withdrawn && !p.ProposalAt.IsZero() && p.Plan != nil && !judged {
 				// a change its replay judges proposes with no count (replayPlan): an older counted plan's wait is not its
 				if wait := r.Ship.waiting(ctx, c, *p.Plan, r.now()); wait != nil {
 					passed = append(passed, c.ID+"'s proposal waits on "+wait.what())

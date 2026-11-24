@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/measure/rekey"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -225,6 +226,30 @@ func TestAHandLandingOfAnotherHeadIsNotJudgedByTheReplay(t *testing.T) {
 		}
 		if got, _, _ := s.Load(c.ID); got.State != Landed || got.Plan.Replay != checked {
 			t.Fatalf("landed the checked head %v: state %s, replay plan %v", checked, got.State, got.Plan.Replay)
+		}
+	}
+}
+
+// A replay covers a case's problem only when it moved all of it out of the case's signatures: each signature keyed in
+// its window and among those it was keyed for, none kept, none moved to another of the case's own, none keyed anew.
+func TestAReplayCoversOnlyAProblemItMovedWhole(t *testing.T) {
+	const a, b, other = "failures/v2:a", "failures/v2:b", "failures/v2:other"
+	dropped := rekey.Diff{Dropped: []rekey.Count{{Signature: a, N: 3}}}
+	for name, c := range map[string]struct {
+		r    SelfReplay
+		sigs []string
+		want bool
+	}{
+		"dropped whole":               {SelfReplay{Diff: dropped, Own: []string{a}, OwnSeen: []string{a}}, []string{a}, true},
+		"re-keyed to another":         {SelfReplay{Diff: rekey.Diff{Rekeyed: []rekey.Move{{From: a, To: other, N: 3}}}, Own: []string{a}, OwnSeen: []string{a}}, []string{a}, true},
+		"some kept":                   {SelfReplay{Diff: dropped, Own: []string{a}, OwnSeen: []string{a}, OwnKept: 1}, []string{a}, false},
+		"re-keyed within the case":    {SelfReplay{Diff: rekey.Diff{Rekeyed: []rekey.Move{{From: a, To: b, N: 3}}}, Own: []string{a, b}, OwnSeen: []string{a}}, []string{a, b}, false},
+		"keyed anew under its own":    {SelfReplay{Diff: rekey.Diff{Dropped: dropped.Dropped, Added: []rekey.Count{{Signature: a, N: 1}}}, Own: []string{a}, OwnSeen: []string{a}}, []string{a}, false},
+		"a signature not in its keys": {SelfReplay{Diff: dropped, Own: []string{a, b}, OwnSeen: []string{a}}, []string{a, b}, false},
+		"a signature taken after it":  {SelfReplay{Diff: dropped, Own: []string{a}, OwnSeen: []string{a}}, []string{a, b}, false},
+	} {
+		if got := replayCovers(&c.r, c.sigs); got != c.want {
+			t.Errorf("%s: covers %v, want %v", name, got, c.want)
 		}
 	}
 }

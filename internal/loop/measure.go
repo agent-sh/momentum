@@ -397,9 +397,10 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 			r.resolve(ctx, &p)
 		}
 	}
-	if c.Status == store.CaseDeployed && p.Check != nil && detectorConfined(p.Changed) && replayCovers(p.Check.Replay, c.Signatures) {
-		// only a change confined to the detectors that moved every one of the case's own events: one that left some
-		// keyed as they were has not moved the case's whole problem, and its measurement reads the rest
+	if c.Status == store.CaseDeployed && plan.Replay && p.Check != nil && p.Check.Replay != nil &&
+		detectorConfined(p.Check.Replay.Paths) && replayCovers(p.Check.Replay, c.Signatures) {
+		// only the plan its replay judged (replayPlan), while the replay still covers the case's signatures: a counted
+		// plan is measured as counted
 		rekeyed, dropped := p.Check.Replay.Diff.Touches(c.Signatures)
 		return r.detectorFixed(ctx, c, &p, m, rekeyed, dropped, dry)
 	}

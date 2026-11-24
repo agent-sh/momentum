@@ -230,8 +230,7 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 		if at.IsZero() {
 			at = s.now()
 		}
-		checked := pr.Head != "" && (pr.Head == p.Head || pr.Head == p.PublishedHead)
-		return p, s.landHand(ctx, c, &p, pr.MergeCommit.OID, at, checked)
+		return p, s.landHand(ctx, c, &p, pr.MergeCommit.OID, at, checkedHead(p, pr.Head))
 	case "CLOSED":
 		// a person who lands a rebased head by a push to the default branch and then closes the request landed it all
 		// the same: the change's files on the default branch as the proposal has them say so
@@ -241,7 +240,7 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 			if err := s.caseNoteOnce(ctx, caseID, "landed by content", fmt.Sprintf("%s was closed, and %s holds its change's files as proposed at %s", p.PR, p.Base, commit)); err != nil {
 				return p, err
 			}
-			return p, s.landHand(ctx, c, &p, commit, at, head == firstOf(p.Head, p.PublishedHead))
+			return p, s.landHand(ctx, c, &p, commit, at, checkedHead(p, head))
 		}
 		p.State = Withdrawn
 		p.ClosedProposals++
@@ -338,6 +337,11 @@ func (s *Ship) caseNoteOnce(ctx context.Context, id, action, detail string) erro
 		}
 	}
 	return s.Store.CaseNote(cleanedNote(ctx), id, action, detail, s.Actor)
+}
+
+// checkedHead says whether a head is the loop's own: the one it checked and published.
+func checkedHead(p Package, head string) bool {
+	return head != "" && (head == p.Head || head == p.PublishedHead)
 }
 
 // landHand records a hand landing at commit, a commit of the default branch, landed at at. A plan counted more than a
