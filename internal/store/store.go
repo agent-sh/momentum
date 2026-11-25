@@ -389,6 +389,41 @@ func OpenReadOnlyExclusive(path string) (*Store, error) {
 	return st, nil
 }
 
+// OpenCopy opens a store's copy to read its events: a plain file the loop made of a window of the store (the loop's
+// StoreCopy), which holds the events and the notes alone, so no schema step, case or cursor. Such a copy is never
+// this build's whole schema, which OpenReadOnly refuses; it is this build's events when its events table has every
+// column this build reads (keptColumns), else ErrNotCurrent. Nothing writes a copy, so it is opened immutable: the
+// read takes no lock and makes no -journal or -shm file, which a read-only bind of the copy could not hold.
+func OpenCopy(path string) (*Store, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("no store copy to read: %w", err)
+	}
+	dsn, err := fileURI(path, "mode=ro&immutable=1")
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	have, err := columns(db, "events")
+	if err == nil && len(have) == 0 {
+		err = fmt.Errorf("%w: it holds no events table", ErrNotCurrent)
+	}
+	for _, k := range keptColumns {
+		for _, c := range k.columns {
+			if err == nil && k.table == "events" && !slices.Contains(have, c[0]) {
+				err = fmt.Errorf("%w: its events have no %s column", ErrNotCurrent, c[0])
+			}
+		}
+	}
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store copy %s: %w", path, err)
+	}
+	return &Store{db: db, path: path}, nil
+}
+
 func openReadOnly(path string, immutable bool) (*Store, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("no store to read: %w; a sessions run, an ingest or a note makes it", err)

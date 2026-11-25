@@ -207,7 +207,8 @@ func (s *Ship) replayOver(ctx context.Context, p Package, tree string, changed [
 		}
 		if o.Exit != 0 {
 			side := map[int]string{0: "the base", 1: "the change"}[i]
-			return nil, refused("the detector replay did not run on %s (exit %d): a change to the detectors keeps internal/measure/rekey/replay building and running", side, o.Exit)
+			return nil, refused("the detector replay did not run on %s (exit %d): a change to the detectors keeps internal/measure/rekey/replay building and running; it ended: %s",
+				side, o.Exit, tailOf([]byte(plain.Line(o.Tail)), 600))
 		}
 		h, k, err := rekey.Read(out)
 		if err != nil {

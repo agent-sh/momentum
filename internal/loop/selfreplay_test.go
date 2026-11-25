@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/measure/rekey"
+	"github.com/agent-sh/momentum/internal/sandbox"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -233,5 +235,49 @@ func TestAReplayCoversOnlyAProblemItMovedWhole(t *testing.T) {
 		if got := replayCovers(&c.r, c.sigs); got != c.want {
 			t.Errorf("%s: covers %v, want %v", name, got, c.want)
 		}
+	}
+}
+
+// The loop's own replay program runs, as a detector change's check runs it, in the sandbox over a copy of the store
+// the pass makes (StoreCopy: its events and notes alone), bound read-only: it opens the copy and writes its keys for
+// the window it was given.
+func TestTheReplayProgramReadsAStoreCopyInTheSandbox(t *testing.T) {
+	sb := testSandbox(t)
+	goodInputScrubber(t)
+	ctx := context.Background()
+	now := time.Now()
+	var events []store.Event
+	for i := range 6 {
+		events = append(events, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("s%d@%d", i%2, i), TS: now.Add(-time.Duration(i+1) * time.Minute),
+			Session: fmt.Sprint("s", i%2), Harness: "claude", Actor: store.ActorTool, Kind: "tool_result", Tool: "Bash",
+			Summary: "Exit code 1 zz-replay-text: the thing broke", Meta: `{"is_error":true}`})
+	}
+	src := filepath.Join(t.TempDir(), "store.sqlite")
+	if _, err := StoreCopy(ctx, StoreCopyOptions{Source: inputStore(t, events), Destination: src, Until: now}); err != nil {
+		t.Fatal(err)
+	}
+	// the tree the replay is built from: this module's own source
+	work := t.TempDir()
+	for _, name := range []string{"go.mod", "go.sum", "internal", "sessions"} {
+		from := filepath.Join("..", "..", name)
+		if name == "internal" || name == "sessions" {
+			if err := os.CopyFS(filepath.Join(work, name), os.DirFS(from)); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		b, err := os.ReadFile(from)
+		if err != nil {
+			t.Fatal(err)
+		}
+		write(t, filepath.Join(work, name), string(b))
+	}
+	since, until := now.Add(-ReplayWindow), now
+	o, out, err := sb.RunOut(ctx, work, replayCmd(since, until), nil, []sandbox.Bind{{Src: src, Dst: replayDst}}, "keys.jsonl", rekey.MaxOutput)
+	if err != nil || o.Exit != 0 {
+		t.Fatalf("the replay over a store copy: exit %d: %v\n%s", o.Exit, err, o.Tail)
+	}
+	if h, _, err := rekey.Read(out); err != nil || !h.Since.Equal(since) || !h.Until.Equal(until) {
+		t.Fatalf("the replay's output: %+v: %v", h, err)
 	}
 }
