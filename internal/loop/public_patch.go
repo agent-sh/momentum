@@ -31,7 +31,7 @@ func (s *Ship) checkPublicPatch(ctx context.Context, p Package, candidate string
 		return err
 	}
 	diff, err := s.git(ctx, p.Host, "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
-		"--no-color", "--text", "-U0", base, candidate, "--")
+		"--no-color", "--text", "--src-prefix=a/", "--dst-prefix=b/", "-U0", base, candidate, "--")
 	if err != nil {
 		return err
 	}
@@ -48,7 +48,7 @@ func publicDiff(ctx context.Context, diff string) error {
 		case strings.HasPrefix(line, "diff --git "):
 			inHunk, file = false, ""
 		case !inHunk && strings.HasPrefix(line, "+++ "):
-			file = strings.TrimPrefix(strings.TrimPrefix(line, "+++ "), "b/")
+			file = diffPath(strings.TrimPrefix(line, "+++ "))
 		case strings.HasPrefix(line, "@@"):
 			inHunk, next = true, hunkStart(line)
 		case inHunk && strings.HasPrefix(line, "+"):
@@ -60,13 +60,31 @@ func publicDiff(ctx context.Context, diff string) error {
 	}
 	err := patchText(ctx, added.String(), "added lines")
 	if errors.Is(err, ErrRefused) && personal(added.String()) {
-		for i, line := range strings.Split(strings.TrimSuffix(added.String(), "\n"), "\n") {
+		lines := strings.Split(strings.TrimSuffix(added.String(), "\n"), "\n")
+		for i, line := range lines {
 			if i < len(at) && personal(line) {
 				return fmt.Errorf("%w; the first such line is %s", err, at[i])
 			}
 		}
+		for i := 1; i < len(lines) && i < len(at); i++ { // content a line break splits: a host after "ssh" on the line before
+			if personal(lines[i-1] + "\n" + lines[i]) {
+				return fmt.Errorf("%w; the first such content ends at %s", err, at[i])
+			}
+		}
 	}
 	return err
+}
+
+// diffPath is the path a "+++ " header names: cut at the tab git adds after a name with a space, unquoted when git
+// quoted it, without its "b/" prefix. A name that does not unquote is kept as git wrote it.
+func diffPath(header string) string {
+	name, _, _ := strings.Cut(header, "\t")
+	if strings.HasPrefix(name, `"`) {
+		if u, err := unquotePath(name); err == nil {
+			name = u
+		}
+	}
+	return strings.TrimPrefix(name, "b/")
 }
 
 // hunkStart is the first line in the new file of a unified diff's hunk header ("@@ -a,b +c,d @@"), 0 when it names none.

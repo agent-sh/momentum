@@ -108,6 +108,15 @@ func TestAPublicPatchRefusalNamesTheLineAndTheReservedForms(t *testing.T) {
 		"+\tok := \"connect ECONNREFUSED 192.0.2.10:443\"\n" +
 		"+\turl := \"https://site-a.example/x\"\n" +
 		"+\tbad := \"connect ECONNREFUSED 10.1.2.3:443\"\n"
+	other := "diff --git a/internal/x/other file.go b/internal/x/other file.go\n" +
+		"--- a/internal/x/other file.go\n+++ b/internal/x/other file.go\t\n" +
+		"@@ -5,2 +5,2 @@\n" +
+		"-\told := 1\n-\tolder := 2\n" +
+		"++++ x\n" +
+		"+\tbad := \"connect ECONNREFUSED 10.9.8.7:443\"\n"
+	if err := publicDiff(context.Background(), other); err == nil || !strings.Contains(err.Error(), "internal/x/other file.go:6") {
+		t.Errorf("the second file's line is not named: %v", err)
+	}
 	err := publicDiff(context.Background(), diff)
 	if !errors.Is(err, ErrRefused) {
 		t.Fatalf("a private address was not refused: %v", err)
