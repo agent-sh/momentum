@@ -1,9 +1,9 @@
 // Command replay runs the replayable detectors of the tree it is built from over a store (detect.Replayable: failures
 // and owner burden) and writes, for each finding, its evidence's event ids with the finding's signature (rekey.Write):
 // what a detectors' run files, after every threshold and filter. The loop runs it, in the sandbox, on the base of a change to its own detectors and
-// on the change, over the same copy of the store, and compares the two (rekey.Compare). Its -store is such a copy (the
-// loop's StoreCopy: the events and notes of a window, a plain file nothing writes), which it opens immutable
-// (store.OpenCopy), so a read-only bind of the copy is enough; it writes only its output file.
+// on the change, over the same copy of the store, and compares the two (rekey.Compare). Its -store is such a copy: the
+// loop's StoreCopy, the events and notes of a window in a plain file nothing writes. It opens the copy immutable
+// (store.OpenCopy) and writes only its output file.
 package main
 
 import (
@@ -22,7 +22,7 @@ import (
 )
 
 func main() {
-	storePath := flag.String("store", "", "the store to read")
+	storePath := flag.String("store", "", "a store copy (the loop's StoreCopy) to read")
 	since := flag.String("since", "", "the window's start (RFC 3339)")
 	until := flag.String("until", "", "the window's end (RFC 3339)")
 	out := flag.String("out", "", "the file to write")

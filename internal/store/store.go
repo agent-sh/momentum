@@ -389,11 +389,11 @@ func OpenReadOnlyExclusive(path string) (*Store, error) {
 	return st, nil
 }
 
-// OpenCopy opens a store's copy to read its events: a plain file the loop made of a window of the store (the loop's
-// StoreCopy), which holds the events and the notes alone, so no schema step, case or cursor. Such a copy is never
-// this build's whole schema, which OpenReadOnly refuses; it is this build's events when its events table has every
-// column this build reads (keptColumns), else ErrNotCurrent. Nothing writes a copy, so it is opened immutable: the
-// read takes no lock and makes no -journal or -shm file, which a read-only bind of the copy could not hold.
+// OpenCopy opens a store's copy to read its events. The copy is a plain file the loop made of a window of the store
+// (the loop's StoreCopy). It holds the events and the notes alone: no schema step, case or cursor, so OpenReadOnly
+// refuses it. It is this build's events when its events table has every column this build reads, else ErrNotCurrent.
+// Nothing writes a copy, so it is opened immutable: the read takes no lock and looks for no journal. A live store is
+// no copy: an immutable read skips its write-ahead log.
 func OpenCopy(path string) (*Store, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("no store copy to read: %w", err)
@@ -406,15 +406,21 @@ func OpenCopy(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	want := []string{"id", "source", "source_key", "ts", "actor", "kind"} // the columns the table was made with
+	for _, k := range keptColumns {
+		if k.table == "events" {
+			for _, c := range k.columns {
+				want = append(want, c[0])
+			}
+		}
+	}
 	have, err := columns(db, "events")
 	if err == nil && len(have) == 0 {
 		err = fmt.Errorf("%w: it holds no events table", ErrNotCurrent)
 	}
-	for _, k := range keptColumns {
-		for _, c := range k.columns {
-			if err == nil && k.table == "events" && !slices.Contains(have, c[0]) {
-				err = fmt.Errorf("%w: its events have no %s column", ErrNotCurrent, c[0])
-			}
+	for _, c := range want {
+		if err == nil && !slices.Contains(have, c) {
+			err = fmt.Errorf("%w: its events have no %s column", ErrNotCurrent, c)
 		}
 	}
 	if err != nil {

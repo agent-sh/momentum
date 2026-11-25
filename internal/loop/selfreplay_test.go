@@ -239,18 +239,18 @@ func TestAReplayCoversOnlyAProblemItMovedWhole(t *testing.T) {
 }
 
 // The loop's own replay program runs, as a detector change's check runs it, in the sandbox over a copy of the store
-// the pass makes (StoreCopy: its events and notes alone), bound read-only: it opens the copy and writes its keys for
-// the window it was given.
+// the pass makes (StoreCopy: its events and notes alone), bound read-only, with replayOver's bind and command: it
+// opens the copy, keys the failures there and writes them for the window it was given.
 func TestTheReplayProgramReadsAStoreCopyInTheSandbox(t *testing.T) {
 	sb := testSandbox(t)
 	goodInputScrubber(t)
 	ctx := context.Background()
 	now := time.Now()
+	// a refusal of the model, three times in two sessions: a failure the detectors file
 	var events []store.Event
-	for i := range 6 {
-		events = append(events, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("s%d@%d", i%2, i), TS: now.Add(-time.Duration(i+1) * time.Minute),
-			Session: fmt.Sprint("s", i%2), Harness: "claude", Actor: store.ActorTool, Kind: "tool_result", Tool: "Bash",
-			Summary: "Exit code 1 zz-replay-text: the thing broke", Meta: `{"is_error":true}`})
+	for i, session := range []string{"s1", "s2", "s2"} {
+		events = append(events, store.Event{Source: "mistakes", SourceKey: fmt.Sprintf("%s@%d", session, i), TS: now.Add(-time.Duration(i+1) * time.Hour),
+			Session: session, Harness: "claude", Actor: store.ActorAgent, Kind: "refusal", Summary: "The model declined this request as written"})
 	}
 	src := filepath.Join(t.TempDir(), "store.sqlite")
 	if _, err := StoreCopy(ctx, StoreCopyOptions{Source: inputStore(t, events), Destination: src, Until: now}); err != nil {
@@ -277,7 +277,13 @@ func TestTheReplayProgramReadsAStoreCopyInTheSandbox(t *testing.T) {
 	if err != nil || o.Exit != 0 {
 		t.Fatalf("the replay over a store copy: exit %d: %v\n%s", o.Exit, err, o.Tail)
 	}
-	if h, _, err := rekey.Read(out); err != nil || !h.Since.Equal(since) || !h.Until.Equal(until) {
-		t.Fatalf("the replay's output: %+v: %v", h, err)
+	h, keys, err := rekey.Read(out)
+	if err != nil || !h.Since.Equal(since) || !h.Until.Equal(until) || len(keys) != len(events) {
+		t.Fatalf("the replay's output: %+v %v: %v", h, keys, err)
+	}
+	for _, e := range events {
+		if !strings.HasPrefix(keys[e.ID()], "failures/") {
+			t.Fatalf("the replay did not key %s as a failure: %v", e.SourceKey, keys)
+		}
 	}
 }

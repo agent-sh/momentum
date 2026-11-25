@@ -206,9 +206,14 @@ func (s *Ship) replayOver(ctx context.Context, p Package, tree string, changed [
 			return nil, err
 		}
 		if o.Exit != 0 {
-			side := map[int]string{0: "the base", 1: "the change"}[i]
-			return nil, refused("the detector replay did not run on %s (exit %d): a change to the detectors keeps internal/measure/rekey/replay building and running; it ended: %s",
-				side, o.Exit, tailOf([]byte(plain.Line(o.Tail)), 600))
+			said := "it printed nothing"
+			if tail := plain.Line(o.Tail); tail != "" {
+				said = "it ended: " + tailOf([]byte(tail), 600)
+			}
+			if i == 0 {
+				return nil, refused("the detector replay did not run on the base (exit %d): the base's internal/measure/rekey/replay must read the store's copy, so a base older than that is rebased; %s", o.Exit, said)
+			}
+			return nil, refused("the detector replay did not run on the change (exit %d): a change to the detectors keeps internal/measure/rekey/replay building and running; %s", o.Exit, said)
 		}
 		h, k, err := rekey.Read(out)
 		if err != nil {
