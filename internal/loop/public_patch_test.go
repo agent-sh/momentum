@@ -99,3 +99,29 @@ func TestPublicPatchAdmitsReservedHostsAndAddresses(t *testing.T) {
 		}
 	}
 }
+
+// A refusal names where the first personal line is and what a fixture may use instead, so a build can fix it.
+func TestAPublicPatchRefusalNamesTheLineAndTheReservedForms(t *testing.T) {
+	diff := "diff --git a/internal/x/x_test.go b/internal/x/x_test.go\n" +
+		"--- a/internal/x/x_test.go\n+++ b/internal/x/x_test.go\n" +
+		"@@ -10,0 +11,3 @@ func TestX(t *testing.T) {\n" +
+		"+\tok := \"connect ECONNREFUSED 192.0.2.10:443\"\n" +
+		"+\turl := \"https://site-a.example/x\"\n" +
+		"+\tbad := \"connect ECONNREFUSED 10.1.2.3:443\"\n"
+	err := publicDiff(context.Background(), diff)
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("a private address was not refused: %v", err)
+	}
+	for _, want := range []string{"internal/x/x_test.go:13", "192.0.2.0/24", "example.com", ".test"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not name %q", err, want)
+		}
+	}
+	if strings.Count(err.Error(), "refused") != 1 {
+		t.Errorf("refusal %q repeats its prefix", err)
+	}
+	clean := strings.Replace(diff, "10.1.2.3", "198.51.100.7", 1)
+	if err := publicDiff(context.Background(), clean); err != nil {
+		t.Errorf("reserved forms were refused: %v", err)
+	}
+}

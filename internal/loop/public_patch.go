@@ -2,9 +2,12 @@ package loop
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/netip"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -32,30 +35,68 @@ func (s *Ship) checkPublicPatch(ctx context.Context, p Package, candidate string
 	if err != nil {
 		return err
 	}
+	return publicDiff(ctx, diff)
+}
+
+// publicDiff checks the lines a unified diff (-U0) adds, and names where the first personal one is.
+func publicDiff(ctx context.Context, diff string) error {
 	var added strings.Builder
-	inHunk := false
+	var at []string // where each added line is in the change: FILE:LINE
+	inHunk, file, next := false, "", 0
 	for _, line := range strings.Split(diff, "\n") {
 		switch {
 		case strings.HasPrefix(line, "diff --git "):
-			inHunk = false
+			inHunk, file = false, ""
+		case !inHunk && strings.HasPrefix(line, "+++ "):
+			file = strings.TrimPrefix(strings.TrimPrefix(line, "+++ "), "b/")
 		case strings.HasPrefix(line, "@@"):
-			inHunk = true
+			inHunk, next = true, hunkStart(line)
 		case inHunk && strings.HasPrefix(line, "+"):
 			added.WriteString(line[1:])
 			added.WriteByte('\n')
+			at = append(at, fmt.Sprintf("%s:%d", file, next))
+			next++
 		}
 	}
-	return patchText(ctx, added.String(), "added lines")
+	err := patchText(ctx, added.String(), "added lines")
+	if errors.Is(err, ErrRefused) && personal(added.String()) {
+		for i, line := range strings.Split(strings.TrimSuffix(added.String(), "\n"), "\n") {
+			if i < len(at) && personal(line) {
+				return fmt.Errorf("%w; the first such line is %s", err, at[i])
+			}
+		}
+	}
+	return err
+}
+
+// hunkStart is the first line in the new file of a unified diff's hunk header ("@@ -a,b +c,d @@"), 0 when it names none.
+func hunkStart(header string) int {
+	m := hunkRe.FindStringSubmatch(header)
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
+var hunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)`)
+
+// personal reports whether text holds personal content: a home path or an address whatever host it names, or, with the
+// reserved names and addresses taken out, anything else the evidence masks.
+func personal(text string) bool {
+	checked := withoutStandardHomes(text)
+	public := withoutReserved(checked)
+	return homePathRe.MatchString(checked) || addressRe.MatchString(checked) || maskPersonal(public) != public
 }
 
 func patchText(ctx context.Context, text, part string) error {
 	// Home paths and addresses are refused whatever host they name; the rest is checked with the reserved names and
 	// addresses taken out.
-	checked := withoutStandardHomes(text)
-	public := withoutReserved(checked)
-	if homePathRe.MatchString(checked) || addressRe.MatchString(checked) || maskPersonal(public) != public {
+	if personal(text) {
 		return refused("patch %s contain personal content (a home path, address, IP or domain-shaped host; "+
-			"a test fixture names a path under its temporary directory, not the home)", part)
+			"a test fixture names a path under its temporary directory, not the home, and names hosts and addresses "+
+			"reserved for examples: example.com, example.net, example.org, a name under .example, .test, .invalid "+
+			"or .localhost, localhost, and 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24, 2001:db8::/32 or loopback)", part)
 	}
 	clean, err := Redact(ctx, text)
 	if err != nil {
