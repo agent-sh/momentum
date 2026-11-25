@@ -217,6 +217,13 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"claude", "mcp__agent-chrome-bridge__chrome_navigate", "No tab with id: 123456789.", ""},
 		{"claude", "mcp__agent-chrome-bridge__chrome_close_tab", "Error: No tab with id: 123456789.", ""},
 		{"claude", "mcp__agent-chrome-bridge__chrome_new_tab", "Chrome bridge extension is not connected", "mcp:agent-chrome-bridge:chrome bridge extension is not connected"},
+		// the REPL's bare ShellError is no failure of its own: the inner Bash call it rethrows keeps its key; a ShellError
+		// with words of its own still is one
+		{"claude", "REPL", "ShellError: Command failed with exit code 128:", ""},
+		{"claude", "REPL", "ShellError: Command failed with exit code 2:", ""},
+		{"claude", "Bash", "Exit code 1 cat: /w/a.txt: No such file or directory", "miss:exec:/w/a.txt"},
+		{"claude", "REPL", "ShellError: [still running] The command did not finish within its 600s timeout.",
+			"tool:repl:shellerror: [still running] the command did not finish within its Ns timeout"},
 		// Codex: a script's error, its commands under either header, the stdin it writes
 		{"codex", "exec", `Script failed Wall time 0.1 seconds Output: Script error: exec_command failed: CreateProcess { message: "Rejected(rm -f)" }`,
 			"tool:exec:exec_command failed: createprocess { message: Q }"},

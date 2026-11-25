@@ -1226,11 +1226,17 @@ var notRunningRe = regexp.MustCompile(`^(?:<tool_use_error>)?Task \S+ is not run
 // closedTabRe is agent-chrome-bridge's answer to a call on a tab that closed before the agent used its id again.
 var closedTabRe = regexp.MustCompile(`^(?:Error: )?No tab with id: \d+\b`)
 
+// replShellRe is the bare record Claude Code writes for a REPL script whose $ shell call exited nonzero: the exit
+// code and nothing else. A ShellError that carries the command's output or the script's report is none.
+var replShellRe = regexp.MustCompile(`^ShellError: Command failed with exit code \d+:?\s*$`)
+
 // toolKey keys a tool's error by its origin and words. A quota that ran out (quotaRe) has no key: it renews by
 // itself and is no fault of the tool, so its case would hold evidence nobody can act on. Nor has a stop of a task
 // that is not running (notRunningRe): what the stop wanted already holds. Nor has agent-chrome-bridge's call on a
-// tab that already closed (closedTabRe): the tab is gone and the bridge said so. A fetch that got no response
-// (unansweredHost) is keyed host:TOOL by its URL's host: its words, the URL masked, are the same for every site. A
+// tab that already closed (closedTabRe): the tab is gone and the bridge said so. Nor has the REPL's bare ShellError
+// (replShellRe): the inner Bash call it rethrows has its own result, with the command and its stderr, and execKey
+// reads the failure there; keyed here too, every unrelated command's failure would fold into one REPL signature
+// and count twice. A fetch that got no response (unansweredHost) is keyed host:TOOL by its URL's host: its words, the URL masked, are the same for every site. A
 // fetch the site answered with an error status (answeredRe) is no failure for a 404 or a 410, a URL that is not
 // there, since the tool worked; any other status is keyed host:TOOL by the status and the host of the URL its words
 // or its call (as the store keeps it) name, and by its words when neither names one.
@@ -1242,6 +1248,9 @@ func toolKey(tool, origin, msg, call string) (FailureKey, bool) {
 		return FailureKey{}, false
 	}
 	if origin == "mcp:agent-chrome-bridge" && closedTabRe.MatchString(msg) {
+		return FailureKey{}, false
+	}
+	if origin == "tool:repl" && replShellRe.MatchString(msg) {
 		return FailureKey{}, false
 	}
 	// An MCP server that opens its error with a markdown heading says what failed on the next line. The sources
