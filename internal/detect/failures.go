@@ -1233,7 +1233,10 @@ var closedTabRe = regexp.MustCompile(`^(?:Error: )?No tab with id: \d+\b`)
 // (unansweredHost) is keyed host:TOOL by its URL's host: its words, the URL masked, are the same for every site. A
 // fetch the site answered with an error status (answeredRe) is no failure for a 404 or a 410, a URL that is not
 // there, since the tool worked; any other status is keyed host:TOOL by the status and the host of the URL its words
-// or its call (as the store keeps it) name, and by its words when neither names one.
+// or its call (as the store keeps it) name, and by its words when neither names one. Claude Code's WebFetch's
+// refusal (refusedRe) names only an address: keyed host:TOOL by its call's URL's host, and not at all without one.
+// Its other errors of no response (noAnswerRe: a reset, a name that did not resolve, a timeout, a closed socket) are
+// keyed host:TOOL by its call's URL's host, and by their words when the call names none.
 func toolKey(tool, origin, msg, call string) (FailureKey, bool) {
 	if quotaRe.MatchString(msg) {
 		return FailureKey{}, false
@@ -1250,6 +1253,21 @@ func toolKey(tool, origin, msg, call string) (FailureKey, bool) {
 	msg = firstClause(toolresult.PastHeadings(tool, msg))
 	if h := unansweredHost(msg); h != "" {
 		return FailureKey{Origin: "host:" + slug(tool, 30), Text: h}, true
+	}
+	// Claude Code's WebFetch names only the address a site refused or never answered on: keyed by the host its call's
+	// URL names, else not at all, since the address masked is the same words for every site.
+	if origin == "tool:webfetch" && refusedRe.MatchString(msg) {
+		u, _, _ := callField(call, map[string]bool{"url": true})
+		if h := urlHost(u); h != "" {
+			return FailureKey{Origin: "host:" + slug(tool, 30), Text: h}, true
+		}
+		return FailureKey{}, false
+	}
+	if origin == "tool:webfetch" && noAnswerRe.MatchString(msg) {
+		u, _, _ := callField(call, map[string]bool{"url": true})
+		if h := urlHost(u); h != "" {
+			return FailureKey{Origin: "host:" + slug(tool, 30), Text: h}, true
+		}
 	}
 	if m := answeredRe.FindStringSubmatch(msg); m != nil {
 		var status, u string
@@ -1288,6 +1306,16 @@ var answeredRe = regexp.MustCompile(`(?i)\bnon 2xx status code \(([45]\d\d) [a-z
 // "Failed to fetch URL due to network error: URL". A status the site answered with is none.
 var unansweredRe = regexp.MustCompile(`(?i)(?:\berror sending request for url \(|\bfailed to fetch url due to network error: )(https?://[^\s()]+)`)
 
+// refusedRe is Claude Code's WebFetch's error that the site's address refused or did not answer its connection,
+// Node's "connect ECONNREFUSED ADDRESS:PORT" or "connect ETIMEDOUT ADDRESS:PORT". It names no host: the address is the
+// remote site's, whatever it resolved to, loopback included.
+var refusedRe = regexp.MustCompile(`(?i)^connect (?:econnrefused|etimedout) \[?[0-9a-f.:]+\]?:\d+$`)
+
+// noAnswerRe is Claude Code's WebFetch's other errors that the site gave no response: Node's "read ECONNRESET",
+// "getaddrinfo ENOTFOUND HOST" or "getaddrinfo EAI_AGAIN HOST", axios's "timeout of Nms exceeded" and "Socket is
+// closed". Their words name the host at most, and a reset or a timeout names none.
+var noAnswerRe = regexp.MustCompile(`(?i)^(?:read econnreset|getaddrinfo (?:enotfound|eai_again) \S+|timeout of \d+ ?ms exceeded|socket is closed)$`)
+
 // unansweredHost is the host of the URL a fetch that got no response names (unansweredRe), lower case, its port and
 // user info off, or "" when the error is none or no host parses from its URL.
 func unansweredHost(msg string) string {
@@ -1322,6 +1350,7 @@ func toolOrigin(tool string) string {
 // error's first line. A deny or a hold is a guard's, as a tool_use_error of Claude Code's is; a model's refusal is
 // keyed by what it said; a turn's error by the harness; a row that says no more than an exit code is not keyed, nor a
 // read that found no file: the store keeps none of the log's input for a tool error, so no call names its path.
+// So a WebFetch refusal of the log, which names only an address, gets no key.
 func MistakeKey(kind, tool, summary string) (FailureKey, bool) {
 	text := strings.TrimSpace(strings.TrimPrefix(summary, tool+":"))
 	switch kind {
