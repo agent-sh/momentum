@@ -705,22 +705,3 @@ func TestMistakesSummarizeAnMCPErrorPastItsHeading(t *testing.T) {
 		}
 	}
 }
-
-// A WebFetch tool error keeps the URL its call asked for in meta: its error names at most the address the site
-// resolved to. Another tool's input stays in the log only. The URLs are synthetic.
-func TestMistakesKeepsAFetchErrorsURL(t *testing.T) {
-	m := Mistakes{Loc: time.UTC}
-	fetch := `{"ts":"2026-01-02T03:04:05","session":"s","kind":"tool-error","tool":"WebFetch","input":"https://sitea/path","detail":"connect ECONNREFUSED"}`
-	ev, reason := m.event([]byte(fetch), "ref")
-	if reason != "" {
-		t.Fatalf("row not read: %s", reason)
-	}
-	var meta map[string]any
-	if err := json.Unmarshal([]byte(ev.Meta), &meta); err != nil || meta["input"] != "https://sitea/path" {
-		t.Fatalf("a fetch error's meta must keep its URL: %s", ev.Meta)
-	}
-	shell := `{"ts":"2026-01-02T03:04:05","session":"s","kind":"tool-error","tool":"Bash","input":"marker-cmd","detail":"exit 2"}`
-	if ev, _ := m.event([]byte(shell), "ref"); strings.Contains(ev.Meta, "marker-cmd") {
-		t.Fatalf("another tool's input leaked into meta: %s", ev.Meta)
-	}
-}

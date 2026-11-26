@@ -191,8 +191,8 @@ func (f Failures) sightings(ctx context.Context, st *store.Store, w Window) (occ
 			continue
 		}
 		// MistakeKey keys no read that found no file, which the transcript does not hold: the store keeps none of the
-		// log's input for that error, so no call names its path. A fetch's call is the URL its meta keeps (mistakeCall).
-		k, ok := mistakeKey(e.Kind, e.Tool, e.Summary, mistakeCall(e.Tool, e.Meta))
+		// log's input for a tool error, so no call names its path
+		k, ok := MistakeKey(e.Kind, e.Tool, e.Summary)
 		if !ok {
 			continue
 		}
@@ -1349,14 +1349,9 @@ func toolOrigin(tool string) string {
 // MistakeKey keys a row of the mistakes log as FailureOf keys a result: its summary is the tool, a colon and the
 // error's first line. A deny or a hold is a guard's, as a tool_use_error of Claude Code's is; a model's refusal is
 // keyed by what it said; a turn's error by the harness; a row that says no more than an exit code is not keyed, nor a
-// read that found no file: the store keeps none of the log's input for that error, so no call names its path.
-// It keys a row with no call; sightings keys a fetch's row with the URL its meta keeps (mistakeKey, mistakeCall).
+// read that found no file: the store keeps none of the log's input for a tool error, so no call names its path.
+// So a WebFetch refusal of the log, which names only an address, gets no key.
 func MistakeKey(kind, tool, summary string) (FailureKey, bool) {
-	return mistakeKey(kind, tool, summary, "")
-}
-
-// mistakeKey is MistakeKey's key with the call's input where the row's meta keeps it (mistakeCall), "" otherwise.
-func mistakeKey(kind, tool, summary, call string) (FailureKey, bool) {
 	text := strings.TrimSpace(strings.TrimPrefix(summary, tool+":"))
 	switch kind {
 	case "refusal":
@@ -1374,37 +1369,7 @@ func mistakeKey(kind, tool, summary, call string) (FailureKey, bool) {
 			text = "<tool_use_error>" + text
 		}
 	}
-	return FailureOf("claude", tool, text, call) // the log is Claude Code's; the store keeps its call only in meta
-}
-
-// mistakeCall is the call a mistakes row of WebFetch's names, from the input its meta keeps: the log's input of a
-// fetch is its URL, made the call {"url": URL}; an input that is already a JSON object is the call as it is. Any
-// other tool's row, or one whose meta keeps no input, has "" (the source keeps the input of WebFetch's errors only).
-func mistakeCall(tool, meta string) string {
-	if tool != "WebFetch" || meta == "" {
-		return ""
-	}
-	var m struct {
-		Input json.RawMessage `json:"input"`
-	}
-	if json.Unmarshal([]byte(meta), &m) != nil || len(m.Input) == 0 {
-		return ""
-	}
-	var s string
-	if json.Unmarshal(m.Input, &s) != nil {
-		return string(m.Input)
-	}
-	if s = strings.TrimSpace(s); strings.HasPrefix(s, "{") {
-		return s
-	}
-	if urlHost(s) == "" {
-		return ""
-	}
-	b, err := json.Marshal(map[string]string{"url": s})
-	if err != nil {
-		return ""
-	}
-	return string(b)
+	return FailureOf("claude", tool, text, "") // the log is Claude Code's, and the store keeps no call of its
 }
 
 // reach is how far before its mark, in the masked output, a failed command's message may start: a program's name

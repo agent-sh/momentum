@@ -194,11 +194,6 @@ func (m Mistakes) attribute(row mistakeRow) (store.Actor, string, map[string]any
 		if row.Cause == "classifier" { // the auto-mode classifier refused the call: a deny, not a tool outcome
 			return store.ActorHarness, toolText(), extra
 		}
-		if row.Tool == "WebFetch" && row.Input != "" {
-			// a fetch's error names at most the address the site resolved to: the URL the call asked for is what
-			// tells one site's failure from another's (the log keeps the call's url as its input)
-			extra["input"] = clip(row.Input, 500)
-		}
 		return store.ActorTool, toolText(), extra
 	case "wait-timeout", "probe", "verdict":
 		return store.ActorTool, toolText(), extra
