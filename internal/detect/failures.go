@@ -1226,11 +1226,20 @@ var notRunningRe = regexp.MustCompile(`^(?:<tool_use_error>)?Task \S+ is not run
 // closedTabRe is agent-chrome-bridge's answer to a call on a tab that closed before the agent used its id again.
 var closedTabRe = regexp.MustCompile(`^(?:Error: )?No tab with id: \d+\b`)
 
+// replUndefinedRe is the exception a script the agent sent to Claude Code's REPL threw when it read a property of
+// a value that was undefined or null: JavaScriptCore's "TypeError: undefined is not an object", alone in the
+// virtual repl-error echo Claude Code writes, or opening the REPL's own report. The REPL ran the script and said
+// where it threw; the bug is the script's (an index past an array's end, a lookup that found nothing). The REPL's
+// own errors (a tool it refused, a script that did not run, a context it lost) are none.
+var replUndefinedRe = regexp.MustCompile(`^(?:<repl-output>\s*)?(?:<error>)?TypeError: (?:undefined|null) is not an object\b`)
+
 // toolKey keys a tool's error by its origin and words. A quota that ran out (quotaRe) has no key: it renews by
 // itself and is no fault of the tool, so its case would hold evidence nobody can act on. Nor has a stop of a task
 // that is not running (notRunningRe): what the stop wanted already holds. Nor has agent-chrome-bridge's call on a
-// tab that already closed (closedTabRe): the tab is gone and the bridge said so. A fetch that got no response
-// (unansweredHost) is keyed host:TOOL by its URL's host: its words, the URL masked, are the same for every site. A
+// tab that already closed (closedTabRe): the tab is gone and the bridge said so. Nor has a REPL script's read of a
+// property of undefined or null (replUndefinedRe): the REPL ran the agent's script and reported its bug. A fetch
+// that got no response (unansweredHost) is keyed host:TOOL by its URL's host: its words, the URL masked, are the
+// same for every site. A
 // fetch the site answered with an error status (answeredRe) is no failure for a 404 or a 410, a URL that is not
 // there, since the tool worked; any other status is keyed host:TOOL by the status and the host of the URL its words
 // or its call (as the store keeps it) name, and by its words when neither names one.
@@ -1242,6 +1251,9 @@ func toolKey(tool, origin, msg, call string) (FailureKey, bool) {
 		return FailureKey{}, false
 	}
 	if origin == "mcp:agent-chrome-bridge" && closedTabRe.MatchString(msg) {
+		return FailureKey{}, false
+	}
+	if origin == "tool:repl" && replUndefinedRe.MatchString(msg) {
 		return FailureKey{}, false
 	}
 	// An MCP server that opens its error with a markdown heading says what failed on the next line. The sources
