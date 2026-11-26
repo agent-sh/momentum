@@ -191,8 +191,8 @@ func (f Failures) sightings(ctx context.Context, st *store.Store, w Window) (occ
 			continue
 		}
 		// MistakeKey keys no read that found no file, which the transcript does not hold: the store keeps none of the
-		// log's input for a tool error, so no call names its path
-		k, ok := MistakeKey(e.Kind, e.Tool, e.Summary)
+		// log's input for that error, so no call names its path. A fetch's call is the URL its meta keeps (mistakeCall).
+		k, ok := mistakeKey(e.Kind, e.Tool, e.Summary, mistakeCall(e.Tool, e.Meta))
 		if !ok {
 			continue
 		}
@@ -1233,7 +1233,10 @@ var closedTabRe = regexp.MustCompile(`^(?:Error: )?No tab with id: \d+\b`)
 // (unansweredHost) is keyed host:TOOL by its URL's host: its words, the URL masked, are the same for every site. A
 // fetch the site answered with an error status (answeredRe) is no failure for a 404 or a 410, a URL that is not
 // there, since the tool worked; any other status is keyed host:TOOL by the status and the host of the URL its words
-// or its call (as the store keeps it) name, and by its words when neither names one.
+// or its call (as the store keeps it) name, and by its words when neither names one. Claude Code's WebFetch's
+// refusal (refusedRe) names only an address: keyed host:TOOL by its call's URL's host, and not at all without one.
+// Its other errors of no response (noAnswerRe: a reset, a name that did not resolve, a timeout, a closed socket) are
+// keyed host:TOOL by its call's URL's host, and by their words when the call names none.
 func toolKey(tool, origin, msg, call string) (FailureKey, bool) {
 	if quotaRe.MatchString(msg) {
 		return FailureKey{}, false
@@ -1250,6 +1253,21 @@ func toolKey(tool, origin, msg, call string) (FailureKey, bool) {
 	msg = firstClause(toolresult.PastHeadings(tool, msg))
 	if h := unansweredHost(msg); h != "" {
 		return FailureKey{Origin: "host:" + slug(tool, 30), Text: h}, true
+	}
+	// Claude Code's WebFetch names only the address a site refused or never answered on: keyed by the host its call's
+	// URL names, else not at all, since the address masked is the same words for every site.
+	if origin == "tool:webfetch" && refusedRe.MatchString(msg) {
+		u, _, _ := callField(call, map[string]bool{"url": true})
+		if h := urlHost(u); h != "" {
+			return FailureKey{Origin: "host:" + slug(tool, 30), Text: h}, true
+		}
+		return FailureKey{}, false
+	}
+	if origin == "tool:webfetch" && noAnswerRe.MatchString(msg) {
+		u, _, _ := callField(call, map[string]bool{"url": true})
+		if h := urlHost(u); h != "" {
+			return FailureKey{Origin: "host:" + slug(tool, 30), Text: h}, true
+		}
 	}
 	if m := answeredRe.FindStringSubmatch(msg); m != nil {
 		var status, u string
@@ -1288,6 +1306,16 @@ var answeredRe = regexp.MustCompile(`(?i)\bnon 2xx status code \(([45]\d\d) [a-z
 // "Failed to fetch URL due to network error: URL". A status the site answered with is none.
 var unansweredRe = regexp.MustCompile(`(?i)(?:\berror sending request for url \(|\bfailed to fetch url due to network error: )(https?://[^\s()]+)`)
 
+// refusedRe is Claude Code's WebFetch's error that the site's address refused or did not answer its connection,
+// Node's "connect ECONNREFUSED ADDRESS:PORT" or "connect ETIMEDOUT ADDRESS:PORT". It names no host: the address is the
+// remote site's, whatever it resolved to, loopback included.
+var refusedRe = regexp.MustCompile(`(?i)^connect (?:econnrefused|etimedout) \[?[0-9a-f.:]+\]?:\d+$`)
+
+// noAnswerRe is Claude Code's WebFetch's other errors that the site gave no response: Node's "read ECONNRESET",
+// "getaddrinfo ENOTFOUND HOST" or "getaddrinfo EAI_AGAIN HOST", axios's "timeout of Nms exceeded" and "Socket is
+// closed". Their words name the host at most, and a reset or a timeout names none.
+var noAnswerRe = regexp.MustCompile(`(?i)^(?:read econnreset|getaddrinfo (?:enotfound|eai_again) \S+|timeout of \d+ ?ms exceeded|socket is closed)$`)
+
 // unansweredHost is the host of the URL a fetch that got no response names (unansweredRe), lower case, its port and
 // user info off, or "" when the error is none or no host parses from its URL.
 func unansweredHost(msg string) string {
@@ -1321,8 +1349,14 @@ func toolOrigin(tool string) string {
 // MistakeKey keys a row of the mistakes log as FailureOf keys a result: its summary is the tool, a colon and the
 // error's first line. A deny or a hold is a guard's, as a tool_use_error of Claude Code's is; a model's refusal is
 // keyed by what it said; a turn's error by the harness; a row that says no more than an exit code is not keyed, nor a
-// read that found no file: the store keeps none of the log's input for a tool error, so no call names its path.
+// read that found no file: the store keeps none of the log's input for that error, so no call names its path.
+// It keys a row with no call; sightings keys a fetch's row with the URL its meta keeps (mistakeKey, mistakeCall).
 func MistakeKey(kind, tool, summary string) (FailureKey, bool) {
+	return mistakeKey(kind, tool, summary, "")
+}
+
+// mistakeKey is MistakeKey's key with the call's input where the row's meta keeps it (mistakeCall), "" otherwise.
+func mistakeKey(kind, tool, summary, call string) (FailureKey, bool) {
 	text := strings.TrimSpace(strings.TrimPrefix(summary, tool+":"))
 	switch kind {
 	case "refusal":
@@ -1340,7 +1374,37 @@ func MistakeKey(kind, tool, summary string) (FailureKey, bool) {
 			text = "<tool_use_error>" + text
 		}
 	}
-	return FailureOf("claude", tool, text, "") // the log is Claude Code's, and the store keeps no call of its
+	return FailureOf("claude", tool, text, call) // the log is Claude Code's; the store keeps its call only in meta
+}
+
+// mistakeCall is the call a mistakes row of WebFetch's names, from the input its meta keeps: the log's input of a
+// fetch is its URL, made the call {"url": URL}; an input that is already a JSON object is the call as it is. Any
+// other tool's row, or one whose meta keeps no input, has "" (the source keeps the input of WebFetch's errors only).
+func mistakeCall(tool, meta string) string {
+	if tool != "WebFetch" || meta == "" {
+		return ""
+	}
+	var m struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if json.Unmarshal([]byte(meta), &m) != nil || len(m.Input) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(m.Input, &s) != nil {
+		return string(m.Input)
+	}
+	if s = strings.TrimSpace(s); strings.HasPrefix(s, "{") {
+		return s
+	}
+	if urlHost(s) == "" {
+		return ""
+	}
+	b, err := json.Marshal(map[string]string{"url": s})
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // reach is how far before its mark, in the masked output, a failed command's message may start: a program's name

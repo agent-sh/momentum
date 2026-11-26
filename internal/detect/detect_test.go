@@ -2536,3 +2536,74 @@ func TestAQueuedNudgeIsNone(t *testing.T) {
 		})
 	}
 }
+
+// Claude Code's WebFetch names only the address a site refused: refusals from different hosts share no key, the
+// same host twice does, and a refusal whose call names no host is keyed by nothing, not by its masked words. The
+// addresses and hosts are synthetic: built from numbers, and hosts with no domain.
+func TestAWebFetchRefusalIsKeyedByItsHost(t *testing.T) {
+	addr := func(a, b, c, d, port int) string { return fmt.Sprintf("%d.%d.%d.%d:%d", a, b, c, d, port) }
+	refused := func(a, b, c, d, port int) string { return "connect ECONNREFUSED " + addr(a, b, c, d, port) }
+	call := func(host, path string) string { return `{"url":"https://` + host + `/` + path + `","prompt":"p"}` }
+	for _, c := range []struct{ tool, text, call, want string }{
+		{"WebFetch", refused(10, 1, 2, 3, 443), call("sitea", "x"), "host:webfetch:sitea"},
+		{"WebFetch", refused(10, 1, 2, 3, 443), call("SiteA", "other"), "host:webfetch:sitea"},
+		{"WebFetch", refused(10, 4, 5, 6, 443), call("siteb", ""), "host:webfetch:siteb"},
+		{"WebFetch", "connect ETIMEDOUT " + addr(10, 7, 8, 9, 443), call("sitec", "y"), "host:webfetch:sitec"},
+		{"WebFetch", refused(127, 0, 0, 1, 443), call("sited", ""), "host:webfetch:sited"},
+		{"WebFetch", refused(10, 1, 2, 3, 443), "", ""},
+		{"WebFetch", refused(10, 1, 2, 3, 443), `{"url":"https://site`, ""},
+		// another tool's refusal is a local service's that went down: its words
+		{"mcp__web-tools__fetch", refused(127, 0, 0, 1, 8080), "", "mcp:web-tools:connect econnrefused N:N"},
+	} {
+		k, ok := FailureOf("claude", c.tool, c.text, c.call)
+		got := k.String()
+		if !ok {
+			got = ""
+		}
+		if got != c.want {
+			t.Errorf("%s %q %q:\n got %q\nwant %q", c.tool, c.text, c.call, got, c.want)
+		}
+	}
+	// the mistakes log's rows: by the URL its meta keeps as the call's input, else by nothing
+	row := func(text, meta string) string {
+		k, ok := mistakeKey("tool-error", "WebFetch", "WebFetch: "+text, mistakeCall("WebFetch", meta))
+		if !ok {
+			return ""
+		}
+		return k.String()
+	}
+	for _, c := range []struct{ text, meta, want string }{
+		{refused(10, 1, 2, 3, 443), `{"input":"https://sitea/x"}`, "host:webfetch:sitea"},
+		{refused(10, 1, 2, 3, 443), `{"input":"https://sitea"}`, "host:webfetch:sitea"},
+		{refused(10, 4, 5, 6, 443), `{"input":"https://siteb/careers"}`, "host:webfetch:siteb"},
+		{refused(127, 0, 0, 1, 443), `{"input":"https://sited/3/"}`, "host:webfetch:sited"},
+		{refused(10, 1, 2, 3, 443), `{"input":{"url":"https://sitea/x","prompt":"p"}}`, "host:webfetch:sitea"},
+		{refused(10, 4, 5, 6, 443), `{"input":"{\"url\":\"https://siteb/x\"}"}`, "host:webfetch:siteb"},
+		{refused(10, 1, 2, 3, 443), `{}`, ""},
+		{refused(10, 1, 2, 3, 443), `{"input":"not a url"}`, ""},
+		{"read ECONNRESET", `{"input":"https://sitee/a"}`, "host:webfetch:sitee"},
+		{"timeout of 60000ms exceeded", `{"input":"https://sitef"}`, "host:webfetch:sitef"},
+		{"Socket is closed", `{"input":"https://siteg/"}`, "host:webfetch:siteg"},
+		{"getaddrinfo ENOTFOUND siteh", `{"input":"https://siteh/"}`, "host:webfetch:siteh"},
+		{"getaddrinfo EAI_AGAIN sitei", `{"input":"https://sitei"}`, "host:webfetch:sitei"},
+		// with no URL kept, these keep their words, as before
+		{"read ECONNRESET", `{}`, "tool:webfetch:read econnreset"},
+		{"timeout of 60000ms exceeded", `{}`, "tool:webfetch:timeout of Nms exceeded"},
+	} {
+		if got := row(c.text, c.meta); got != c.want {
+			t.Errorf("mistakes row %q meta %s:\n got %q\nwant %q", c.text, c.meta, got, c.want)
+		}
+	}
+	if row(refused(10, 1, 2, 3, 443), `{"input":"https://sitea/x"}`) == row(refused(10, 4, 5, 6, 443), `{"input":"https://siteb/x"}`) {
+		t.Errorf("refusals of two hosts share a key")
+	}
+	// another tool's input is no call: its row keys as before
+	if got := mistakeCall("Bash", `{"input":"https://sitea/x"}`); got != "" {
+		t.Errorf("a Bash row's input made a call %q", got)
+	}
+	for _, s := range []string{"WebFetch: " + refused(10, 1, 2, 3, 443), "WebFetch: " + refused(10, 4, 5, 6, 443)} {
+		if k, ok := MistakeKey("tool-error", "WebFetch", s); ok {
+			t.Errorf("mistakes row %q with no input keyed %q", s, k.String())
+		}
+	}
+}
