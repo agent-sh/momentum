@@ -1239,10 +1239,9 @@ var replUndefinedRe = regexp.MustCompile(`^(?:<repl-output>\s*)?(?:<error>)?Type
 // tab that already closed (closedTabRe): the tab is gone and the bridge said so. Nor has a REPL script's read of a
 // property of undefined or null (replUndefinedRe): the REPL ran the agent's script and reported its bug. A fetch
 // that got no response (unansweredHost) is keyed host:TOOL by its URL's host: its words, the URL masked, are the
-// same for every site. A
-// fetch the site answered with an error status (answeredRe) is no failure for a 404 or a 410, a URL that is not
-// there, since the tool worked; any other status is keyed host:TOOL by the status and the host of the URL its words
-// or its call (as the store keeps it) name, and by its words when neither names one.
+// same for every site. A fetch the site answered with an error status (answeredRe) is no failure for a 404 or a
+// 410, a URL that is not there, since the tool worked; any other status is keyed host:TOOL by the status and the
+// host of the URL its words or its call (as the store keeps it) name, and by its words when neither names one.
 func toolKey(tool, origin, msg, call string) (FailureKey, bool) {
 	if quotaRe.MatchString(msg) {
 		return FailureKey{}, false
